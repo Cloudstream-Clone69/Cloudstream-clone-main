@@ -11,6 +11,7 @@ OutputBaseFilename=cloudstream_setup
 Compression=lzma
 SolidCompression=yes
 SetupIconFile=cloudstream_app\windows\runner\resources\app_icon.ico
+PrivilegesRequired=lowest
 
 [Files]
 Source: "cloudstream_app\build\windows\x64\runner\Release\cloudstream_app.exe"; DestDir: "{app}"; Flags: ignoreversion

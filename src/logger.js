@@ -1,7 +1,8 @@
-﻿import fs from 'fs';
+import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
-const logFile = path.join(process.cwd(), 'app.log');
+const logFile = path.join(os.tmpdir(), 'cloudstream-backend.log');
 
 function timestamp() {
   return new Date().toISOString();
