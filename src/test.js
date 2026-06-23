@@ -1,7 +1,6 @@
-﻿import readline from 'readline';
+import readline from 'readline';
 import anidaoRaw from './providers/anidao/index.js';
 import fourkhdhubRaw from './providers/4khdhub/index.js';
-import hdmoviesplusRaw from './providers/hdmoviesplus/index.js';
 import { fetchHTML } from './providers/common.js';
 import * as cheerio from 'cheerio';
 import { wrapProvider } from './providers/wrapper.js';
@@ -11,15 +10,15 @@ import { info, error } from './logger.js';
 
 const anidao = wrapProvider(anidaoRaw, 'anidao');
 const fourkhdhub = wrapProvider(fourkhdhubRaw, 'fourkhdhub');
-const hdmoviesplus = wrapProvider(hdmoviesplusRaw, 'hdmoviesplus');
 
-const providersMap = { anidao, fourkhdhub, hdmoviesplus };
+
+const providersMap = { anidao, fourkhdhub };
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 function ask(q) { return new Promise(resolve => rl.question(q, resolve)); }
 
 // Helper to extract all server links from 4KHDHub's generate page
 async function get4KHDHubServers(hubcloudUrl) {
-  const html1 = await fetchHTML(hubcloudUrl, 'https://4khdhub.link');
+  const html1 = await fetchHTML(hubcloudUrl, 'https://4khdhub.one');
   const $1 = cheerio.load(html1);
   const generateUrl = $1('a#download[href*="gamerxyt.com"]').attr('href');
   if (!generateUrl) throw new Error('Generate link not found');
@@ -66,7 +65,7 @@ async function main() {
 
   let searchProvider;
   if (!config.fallbackEnabled) {
-    console.log('\nAvailable providers: anidao, fourkhdhub, hdmoviesplus');
+console.log('\nAvailable providers: anidao, fourkhdhub');
     const provName = await ask('Enter provider name: ');
     searchProvider = providersMap[provName];
     if (!searchProvider) { console.log('Invalid provider.'); rl.close(); return; }

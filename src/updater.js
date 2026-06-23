@@ -1,40 +1,42 @@
 ﻿import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { fetchJSON, fetchHTML } from './providers/common.js';   // custom client with TLS fix
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Project root is one level up (since updater.js lives in src/)
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
-const REPO_RAW = 'https://raw.githubusercontent.com/Cloudstream-Clone69/Cloudstream-clone/main';
+const REPO_RAW = 'https://raw.githubusercontent.com/Cloudstream-Clone69/Cloudstream-clone/v2';
 
-async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-  const text = await res.text();
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error(`Invalid JSON: ${text.substring(0, 100)}`);
-  }
+async function fetchText(url) {
+  return fetchHTML(url);   // uses the configured Axios client
 }
 
 export async function checkForUpdates() {
   console.log('Checking for provider updates...');
   const manifestUrl = `${REPO_RAW}/providers.json`;
-  const manifest = await fetchJSON(manifestUrl);
+  console.log('Fetching manifest:', manifestUrl);
+  let manifest;
+  try {
+    manifest = await fetchJSON(manifestUrl);
+  } catch (err) {
+    console.error('Failed to fetch manifest:', err.message);
+    return [];
+  }
+  console.log('Manifest loaded:', JSON.stringify(manifest));
   const updates = [];
 
   for (const [name, remoteVersion] of Object.entries(manifest.providers)) {
     const localVersionFile = path.join(PROJECT_ROOT, 'src', 'providers', name, 'version.json');
     try {
       const localData = JSON.parse(await fs.readFile(localVersionFile, 'utf8'));
+      console.log(`[${name}] local: ${localData.version}, remote: ${remoteVersion}`);
       if (localData.version !== remoteVersion) {
         updates.push({ name, remoteVersion, localVersion: localData.version });
       }
     } catch {
-      // provider not installed, skip
+      console.log(`[${name}] no local version file, skipping`);
     }
   }
 
@@ -56,9 +58,7 @@ export async function checkForUpdates() {
 export async function downloadAndUpdate(updates) {
   for (const update of updates) {
     if (update.name === 'common') {
-      const res = await fetch(`${REPO_RAW}/src/providers/common.js`);
-      if (!res.ok) throw new Error(`Failed to download common.js`);
-      const content = await res.text();
+      const content = await fetchText(`${REPO_RAW}/src/providers/common.js`);
       const targetPath = path.join(PROJECT_ROOT, 'src', 'providers', 'common.js');
       await fs.writeFile(targetPath, content);
       await fs.writeFile(
@@ -69,9 +69,7 @@ export async function downloadAndUpdate(updates) {
       const provider = update.name;
       const files = ['index.js', 'selectors.js', 'version.json'];
       for (const file of files) {
-        const res = await fetch(`${REPO_RAW}/src/providers/${provider}/${file}`);
-        if (!res.ok) throw new Error(`Failed to download ${file} for ${provider}`);
-        const content = await res.text();
+        const content = await fetchText(`${REPO_RAW}/src/providers/${provider}/${file}`);
         const targetPath = path.join(PROJECT_ROOT, 'src', 'providers', provider, file);
         await fs.writeFile(targetPath, content);
       }

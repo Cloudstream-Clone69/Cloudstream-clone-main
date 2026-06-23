@@ -1,4 +1,4 @@
-﻿export const BASE_URL = 'https://4khdhub.link';
+export const BASE_URL = 'https://4khdhub.one';
 
 export const SEARCH = {
   url: (query) => `${BASE_URL}/?s=${encodeURIComponent(query)}`,

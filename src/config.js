@@ -1,4 +1,4 @@
-﻿import fs from 'fs';
+import fs from 'fs';
 import path from 'path';
 
 const projectRoot = process.cwd();
@@ -8,7 +8,7 @@ let config = {
   cacheTTL: 300000,
   logLevel: 'info',
   fallbackEnabled: true,            // ← default ON
-  fallbackOrder: ['anidao', 'hdmoviesplus', 'fourkhdhub']
+  fallbackOrder: ['anidb', '4khdhub']
 };
 
 try {
