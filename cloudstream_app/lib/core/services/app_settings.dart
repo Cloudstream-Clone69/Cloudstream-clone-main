@@ -217,7 +217,7 @@ class AppSettings extends ChangeNotifier {
     _animeProviderOrder  = _decodeOrder(prefs.getString('anime_provider_order'),  ['anidb', '4khdhub']);
     _accentColorHex     = prefs.getString('accent_color') ?? 'E50914';
     _backendUrl         = prefs.getString('backend_url') ?? kBaseUrl;
-    if (_backendUrl == 'http://localhost:3000') {
+    if (_backendUrl.contains('onrender.com') || _backendUrl == 'http://localhost:3000') {
       _backendUrl = kBaseUrl;
       await prefs.setString('backend_url', _backendUrl);
     }

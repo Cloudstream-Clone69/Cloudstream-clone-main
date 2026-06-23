@@ -27,9 +27,13 @@ import 'core/services/app_settings.dart';
 import 'core/services/download_service.dart';
 import 'core/api/dns_over_https.dart';
 
+import 'core/services/local_backend.dart';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await windowManager.ensureInitialized();
+  // Start local backend server automatically
+  await LocalBackend.start();
   // Fix SSL HandshakeException on Windows (TLS negotiation issues with some servers)
   HttpOverrides.global = _TrustAllCerts();
   MediaKit.ensureInitialized();

@@ -14,8 +14,10 @@ SetupIconFile=cloudstream_app\windows\runner\resources\app_icon.ico
 
 [Files]
 Source: "cloudstream_app\build\windows\x64\runner\Release\cloudstream_app.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "cloudstream_app\build\windows\x64\runner\Release\node.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "cloudstream_app\build\windows\x64\runner\Release\*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "cloudstream_app\build\windows\x64\runner\Release\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "cloudstream_app\build\windows\x64\runner\Release\backend\*"; DestDir: "{app}\backend"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\CloudStream"; Filename: "{app}\cloudstream_app.exe"

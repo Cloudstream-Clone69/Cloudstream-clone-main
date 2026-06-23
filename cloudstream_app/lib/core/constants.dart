@@ -1,6 +1,6 @@
 // lib/core/constants.dart
 
-const String kBaseUrl = 'https://cloudstream-clone-main.onrender.com';
+const String kBaseUrl = 'http://localhost:3000';
 
 const List<String> kProviders = ['anidao', '4khdhub'];
 

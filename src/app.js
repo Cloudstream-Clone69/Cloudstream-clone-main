@@ -62,9 +62,27 @@ app.post("/api/updates/apply", async (req, res) => {
     }
     await downloadAndUpdate(names);
     res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
+
+// ---------- HEARTBEAT MONITORING (Auto-Close) ----------
+let lastHeartbeat = Date.now();
+
+app.post("/api/heartbeat", (req, res) => {
+  lastHeartbeat = Date.now();
+  res.json({ success: true });
+});
+
+if (process.argv.includes('--autoclose')) {
+  console.log('[Heartbeat] Auto-close monitoring active. Server will terminate if client heartbeat is lost.');
+  // Wait 15 seconds before starting strict heartbeat enforcement to allow app to fully start
+  setTimeout(() => {
+    setInterval(() => {
+      if (Date.now() - lastHeartbeat > 10000) {
+        console.log('[Heartbeat] Lost connection to client. Shutting down Node server...');
+        process.exit(0);
+      }
+    }, 3000);
+  }, 15000);
+}
 
 export default app;
