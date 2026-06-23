@@ -293,22 +293,25 @@ async function getStreamsFromHubcloud(hubcloudUrl) {
     try {
       const finalUrl = await resolveFinalUrl(serverLink, generateUrl);
       console.log(`    Resolved: ${finalUrl}`);
-      if (videoExts.some(ext => finalUrl.toLowerCase().includes('.' + ext))) {
-        const check = await headRequest(finalUrl, generateUrl, 5000);
-        if (check) {
+      const headers = await headRequest(finalUrl, generateUrl, 5000);
+      if (headers) {
+        const contentType = (headers['content-type'] || '').toLowerCase();
+        const contentLength = parseInt(headers['content-length'] || '0', 10);
+        const contentDisp = (headers['content-disposition'] || '').toLowerCase();
+
+        const hasVideoExt = videoExts.some(ext => finalUrl.toLowerCase().includes('.' + ext)) ||
+                            videoExts.some(ext => contentDisp.includes('.' + ext));
+
+        const isMedia = contentType.startsWith('video/') ||
+                        contentType.includes('mpegurl') ||
+                        contentType.includes('dash+xml') ||
+                        (contentType === 'application/octet-stream' && contentLength > 10 * 1024 * 1024);
+
+        if (hasVideoExt || isMedia) {
+          console.log(`      [Validation] Resolved stream URL OK (Media/Extension match)`);
           return { streamUrl: finalUrl, referer: generateUrl };
         }
       }
-      // Check if resolved URL is a CDN
-      try {
-        const resolvedHost = new URL(finalUrl).hostname;
-        if (isDirectCdn(resolvedHost)) {
-          const check = await headRequest(finalUrl, generateUrl, 5000);
-          if (check) {
-            return { streamUrl: finalUrl, referer: generateUrl };
-          }
-        }
-      } catch {}
     } catch (e) {
       console.error(`    Error: ${e.message}`);
     }
@@ -327,6 +330,14 @@ async function getStreamsFromDirect(directUrl) {
     }
     const html = await fetchHTML(directUrl, BASE_URL, 2, 30000);
     const $ = cheerio.load(html);
+
+    // If it's a detail/intermediate page link, extract the HubCloud download link and resolve it
+    const hubcloudLink = $('a[href*="hubcloud"]').first().attr('href');
+    if (hubcloudLink) {
+      console.log(`  Found HubCloud link on page: ${hubcloudLink}`);
+      return getStreamsFromHubcloud(hubcloudLink);
+    }
+
     for (const ext of videoExts) {
       const link = $(`a[href$=".${ext}"]`).first().attr('href');
       if (link) {
