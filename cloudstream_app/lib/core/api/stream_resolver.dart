@@ -10,9 +10,17 @@
 
 import 'dart:async';
 import 'package:dio/dio.dart';
+import '../services/app_settings.dart';
 
-// AniDB for anime; 4KHDHub for everything else
-const List<String> _kProviders = ['anidb', '4khdhub'];
+// ── Provider helpers ─────────────────────────────────────────────────
+
+bool _isEnabled(String p, AppSettings s) {
+  switch (p) {
+    case '4khdhub':  return s.enable4kHdHub;
+    case 'anidb':    return s.enableAniDb;
+    default:         return false;
+  }
+}
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
@@ -27,6 +35,7 @@ class StreamSource {
   final String referer;
   final String subtitleUrl;  // VTT subtitle if available
   final String episodeUrl;   // hubcloud.foo URL — used to re-resolve fresh URL
+  final String cookie;       // Optional signed cookie (e.g. CloudFront-Policy for MovieBox DASH)
 
   const StreamSource({
     required this.provider,
@@ -38,6 +47,7 @@ class StreamSource {
     required this.referer,
     this.subtitleUrl = '',
     this.episodeUrl = '',
+    this.cookie = '',
   });
 
   /// Re-resolve a fresh stream URL (call when URL expires)
@@ -72,11 +82,9 @@ class EpisodeRef {
 
   String get label {
     final providerLabel = switch (provider) {
-      '4khdhub' => '4KHD Hub',
-      'hdhub4u' => 'HDHub4U',
-      'anidao'  => 'AniDAO',
-      'anidb'   => 'AniDB',
-      _         => provider,
+      '4khdhub'  => '4KHD Hub',
+      'anidb'    => 'AniDB',
+      _          => provider,
     };
     final sizePart = size.isNotEmpty ? ' · $size' : '';
     final titlePart = title.isNotEmpty ? ' · ${title.split('\n').first.trim()}' : '';
@@ -93,15 +101,18 @@ class EpisodeRef {
 // ── Resolver ──────────────────────────────────────────────────────────────────
 
 class StreamResolver {
-  static const String _baseUrl = 'http://localhost:3000';
+  static String get _baseUrl => AppSettings.instance.backendUrl;
 
-  /// Main Dio: used for /search, /details, /stream backend calls.
-  final Dio _dio = Dio(BaseOptions(
-    baseUrl: _baseUrl,
+  final Dio _dioInstance = Dio(BaseOptions(
     connectTimeout: const Duration(seconds: 12),
     receiveTimeout: const Duration(seconds: 20),
     validateStatus: (s) => true,
   ));
+
+  Dio get _dio {
+    _dioInstance.options.baseUrl = AppSettings.instance.backendUrl;
+    return _dioInstance;
+  }
 
   /// Validator Dio: fire-and-forget HEAD checks on CDN URLs.
   /// Short timeouts — we only need to know the file exists.
@@ -113,6 +124,29 @@ class StreamResolver {
 
   StreamResolver._();
   static final instance = StreamResolver._();
+
+  int _scoreQuality(String quality) {
+    final q = quality.toLowerCase();
+    if (q.contains('4k') || q.contains('2160')) return 100;
+    if (q.contains('1080')) return 90;
+    if (q.contains('720')) return 80;
+    if (q.contains('480')) return 70;
+    if (q.contains('360')) return 60;
+    return 0;
+  }
+
+  double _parseSizeToMb(String sizeStr) {
+    final s = sizeStr.toLowerCase().trim();
+    if (s.isEmpty) return 0.0;
+    final numMatch = RegExp(r'([\d\.]+)').firstMatch(s);
+    if (numMatch == null) return 0.0;
+    final val = double.tryParse(numMatch.group(1) ?? '0.0') ?? 0.0;
+    if (s.contains('gb') || s.contains('g')) return val * 1024.0;
+    if (s.contains('tb') || s.contains('t')) return val * 1024.0 * 1024.0;
+    if (s.contains('mb') || s.contains('m')) return val;
+    if (s.contains('kb') || s.contains('k')) return val / 1024.0;
+    return val;
+  }
 
   /// Shared Dio instance for proxy requests (e.g. fetching HLS playlists).
   static Dio get dio => instance._dio;
@@ -133,10 +167,8 @@ class StreamResolver {
 
   /// Fast: returns the first working, pre-validated stream source for immediate playback.
   ///
-  /// For anime  (isAnime=true): resolves AniDB refs sequentially (Sub preferred).
-  /// For non-anime (isAnime=false): resolves ALL 4KHDHub refs IN PARALLEL and
-  ///   returns the first one that passes a HEAD validation — meaning MPV will
-  ///   definitely be able to open it without a buffering failure.
+  /// Uses AppSettings priority order per content type.
+  /// All eligible providers are raced in parallel — first valid stream wins.
   Future<StreamSource?> resolveFirstSource({
     required String title,
     required String mediaType,
@@ -145,72 +177,81 @@ class StreamResolver {
     String? episodeNumber,
     String? preferredQuality,
     bool isAnime = false,
+    String? provider,
   }) async {
-    final provider = isAnime ? 'anidb' : '4khdhub';
-    print('[StreamResolver] resolveFirstSource: isAnime=$isAnime → $provider');
+    final settings = AppSettings.instance;
+    final List<String> rawOrder = isAnime
+        ? settings.animeProviderOrder
+        : (mediaType == 'movie'
+            ? settings.movieProviderOrder
+            : settings.seriesProviderOrder);
+    List<String> providers;
+    if (provider != null && provider.isNotEmpty) {
+      providers = [provider];
+    } else {
+      providers = rawOrder.where((p) => _isEnabled(p, settings)).toList();
+    }
+
+    print('[StreamResolver] resolveFirstSource: providers=$providers isAnime=$isAnime');
+    if (providers.isEmpty) return null;
 
     try {
-      final refs = await _getEpisodeRefs(
-        provider: provider, title: title, mediaType: mediaType,
-        year: year, seasonNumber: seasonNumber, episodeNumber: episodeNumber,
-        maxRefs: isAnime ? 3 : 8, // grab more 4KHDHub refs for parallel racing
-      );
-      if (refs.isEmpty) return null;
+      final raceCompleter = Completer<StreamSource?>();
+      int totalPending = 0;
 
-      // ── AniDB: sequential with Sub preference ────────────────────────────
-      if (isAnime) {
-        final sortedRefs = <EpisodeRef>[];
-        if (preferredQuality != null) {
-          sortedRefs.addAll(refs.where((r) => r.quality.toLowerCase() == preferredQuality.toLowerCase()));
-          sortedRefs.addAll(refs.where((r) => r.quality.toLowerCase() != preferredQuality.toLowerCase()));
-        } else {
-          sortedRefs.addAll(refs);
-        }
-        for (final ref in sortedRefs) {
-          final src = await resolveStreamForEpisode(
-            provider: provider, episodeUrl: ref.episodeUrl,
-            quality: ref.quality, size: ref.size, label: ref.label,
+      void launchProvider(String prov) async {
+        totalPending++;
+        try {
+          final provRefs = await _getEpisodeRefs(
+            provider: prov, title: title, mediaType: mediaType,
+            year: year, seasonNumber: seasonNumber, episodeNumber: episodeNumber,
+            maxRefs: 5,
           );
-          if (src != null) return src;
-        }
-        return null;
-      }
-
-      // ── 4KHDHub: resolve ALL refs in parallel, first validated URL wins ──
-      print('[StreamResolver] Racing ${refs.length} 4KHDHub refs in parallel…');
-      final completer = Completer<StreamSource?>();
-      int pending = refs.length;
-
-      for (final ref in refs) {
-        resolveStreamForEpisode(
-          provider: provider, episodeUrl: ref.episodeUrl,
-          quality: ref.quality, size: ref.size, label: ref.label,
-        ).then((src) async {
-          if (completer.isCompleted) return;
-          if (src == null) {
-            if (--pending == 0) completer.complete(null);
-            return;
-          }
-          // HEAD-validate: confirm the CDN URL is reachable & is a video file
-          final valid = await _validateUrl(src.url);
-          if (completer.isCompleted) return;
-          if (valid) {
-            print('[StreamResolver] ✓ Validated: ${src.label}');
-            completer.complete(src);
+          // Sort by preferred quality if given, otherwise sort by quality score descending
+          final sorted = <EpisodeRef>[];
+          if (preferredQuality != null && preferredQuality.isNotEmpty) {
+            sorted.addAll(provRefs.where((r) =>
+                r.quality.toLowerCase() == preferredQuality.toLowerCase()));
+            sorted.addAll(provRefs.where((r) =>
+                r.quality.toLowerCase() != preferredQuality.toLowerCase()));
           } else {
-            print('[StreamResolver] ✗ HEAD failed, skipping: ${src.url.substring(0, 60)}…');
-            if (--pending == 0) completer.complete(null);
+            final list = [...provRefs];
+            final indexed = list.asMap().entries.toList();
+            indexed.sort((entryA, entryB) {
+              final scoreA = _scoreQuality(entryA.value.quality);
+              final scoreB = _scoreQuality(entryB.value.quality);
+              if (scoreA != scoreB) return scoreB.compareTo(scoreA);
+              final sizeA = _parseSizeToMb(entryA.value.size);
+              final sizeB = _parseSizeToMb(entryB.value.size);
+              if (sizeA != sizeB) return sizeB.compareTo(sizeA);
+              return entryA.key.compareTo(entryB.key);
+            });
+            sorted.addAll(indexed.map((e) => e.value));
           }
-        }).catchError((_) {
-          if (!completer.isCompleted && --pending == 0) completer.complete(null);
-        });
+          for (final ref in sorted) {
+            if (raceCompleter.isCompleted) return;
+            final src = await resolveStreamForEpisode(
+              provider: prov, episodeUrl: ref.episodeUrl,
+              quality: ref.quality, size: ref.size, label: ref.label,
+            );
+            if (src != null && src.url.isNotEmpty && !raceCompleter.isCompleted) {
+              raceCompleter.complete(src);
+              return;
+            }
+          }
+        } catch (_) {}
+        // This provider exhausted — if all done, signal null
+        if (--totalPending <= 0 && !raceCompleter.isCompleted) {
+          raceCompleter.complete(null);
+        }
       }
 
-      // Overall timeout: if nothing validated in 45s, give up
-      return completer.future.timeout(
-        const Duration(seconds: 45),
+      for (final p in providers) launchProvider(p);
+
+      return raceCompleter.future.timeout(
+        const Duration(seconds: 20),
         onTimeout: () {
-          if (!completer.isCompleted) completer.complete(null);
+          if (!raceCompleter.isCompleted) raceCompleter.complete(null);
           return null;
         },
       );
@@ -225,9 +266,14 @@ class StreamResolver {
   Future<bool> _validateUrl(String url) async {
     if (url.isEmpty) return false;
     try {
-      // HLS playlists don't work well with HEAD — trust them directly
-      if (url.contains('.m3u8')) {
-        print('[StreamResolver] [validate] HLS — trusting without HEAD: $url');
+      // Our local DASH→HLS proxy — always trust it immediately
+      if (url.contains('127.0.0.1') || url.contains('localhost')) {
+        print('[StreamResolver] [validate] Local proxy — trusting: $url');
+        return true;
+      }
+      // HLS and DASH manifests don't work with HEAD/byte-range — trust them directly
+      if (url.contains('.m3u8') || url.contains('.mpd')) {
+        print('[StreamResolver] [validate] HLS/DASH manifest — trusting: $url');
         return true;
       }
       // For direct video files: send a Range: bytes=0-1023 request
@@ -256,9 +302,9 @@ class StreamResolver {
     }
   }
 
-  /// Returns episode refs for the Sources panel.
-  /// For anime (isAnime=true): AniDB only.
-  /// For non-anime (isAnime=false): 4KHDHub only — AniDB is never tried.
+  /// Returns episode refs for ALL enabled providers, ordered by user priority.
+  /// For anime: uses animeProviderOrder; for movies/series: movieProviderOrder/seriesProviderOrder.
+  /// Queries all providers in parallel and returns merged results in priority order.
   Future<List<EpisodeRef>> getEpisodeRefs({
     required String title,
     required String mediaType,
@@ -266,13 +312,53 @@ class StreamResolver {
     String? seasonNumber,
     String? episodeNumber,
     bool isAnime = false,
+    String? provider,
+    String? showUrl,
   }) async {
-    final provider = isAnime ? 'anidb' : '4khdhub';
-    print('[StreamResolver] getEpisodeRefs isAnime=$isAnime → provider: $provider');
-    return _getEpisodeRefs(
-      provider: provider, title: title, mediaType: mediaType,
-      year: year, seasonNumber: seasonNumber, episodeNumber: episodeNumber,
-    ).catchError((_) => <EpisodeRef>[]);
+    final settings = AppSettings.instance;
+    final List<String> rawOrder = isAnime
+        ? settings.animeProviderOrder
+        : (mediaType == 'movie'
+            ? settings.movieProviderOrder
+            : settings.seriesProviderOrder);
+
+    List<String> providers;
+    if (provider != null && provider.isNotEmpty) {
+      providers = [provider];
+    } else {
+      providers = rawOrder.where((p) => _isEnabled(p, settings)).toList();
+    }
+
+    // Restrict AniDB solely to anime searches to prevent wrong/mismatched episodes
+    if (!isAnime) {
+      providers = providers.where((p) => p != 'anidb').toList();
+    }
+
+    if (providers.isEmpty) return [];
+    print('[StreamResolver] getEpisodeRefs providers: $providers (isAnime=$isAnime)');
+
+    // Query all providers in parallel
+    final futures = providers.map((p) =>
+      _getEpisodeRefs(
+        provider: p, title: title, mediaType: mediaType,
+        year: year, seasonNumber: seasonNumber, episodeNumber: episodeNumber,
+        showUrl: showUrl,
+      ).catchError((_) => <EpisodeRef>[])
+    );
+    final results = await Future.wait(futures);
+
+    final allRefs = results.expand((refs) => refs).toList();
+    final indexedRefs = allRefs.asMap().entries.toList();
+    indexedRefs.sort((entryA, entryB) {
+      final scoreA = _scoreQuality(entryA.value.quality);
+      final scoreB = _scoreQuality(entryB.value.quality);
+      if (scoreA != scoreB) return scoreB.compareTo(scoreA);
+      final sizeA = _parseSizeToMb(entryA.value.size);
+      final sizeB = _parseSizeToMb(entryB.value.size);
+      if (sizeA != sizeB) return sizeB.compareTo(sizeA);
+      return entryA.key.compareTo(entryB.key);
+    });
+    return indexedRefs.map((e) => e.value).toList();
   }
 
   /// Resolves a stream URL for a specific episode ref (always fresh).
@@ -300,16 +386,47 @@ class StreamResolver {
       final streamUrl = streams['streamUrl']?.toString() ?? '';
       final proxyUrl = streams['proxyUrl']?.toString() ?? '';
       final referer = streams['referer']?.toString() ?? '';
+      // Extract Cookie if provided (e.g. CloudFront signed cookies for MovieBox DASH)
+      final headers = streams['headers'];
+      final cookie = (headers is Map ? headers['Cookie'] : null)?.toString() ?? '';
 
-      // Strategy: always use the DIRECT stream URL and let MPV handle HLS natively.
-      // MPV receives correct User-Agent + Referer via properties set in _openSource,
-      // so it can fetch playlists AND segments from the CDN without a proxy middleman.
-      // The proxyUrl is kept as fallback for cases where direct access truly fails.
+      // URL strategy:
+      // ── DASH (.mpd) ──────────────────────────────────────────────────────────
+      // Convert DASH→HLS via the server-side /proxy/dash converter.
+      // MPV's HLS demuxer is rock-solid; its DASH demuxer on Windows is broken
+      // (fetches the MPD endlessly but never requests any segments).
+      //
+      // /proxy/dash parses the MPD SegmentTimeline into an explicit HLS M3U8
+      // with absolute segment URLs through /proxy/segment (CF cookie injected
+      // server-side). No $Number$ template variables, no %xx encoding issues.
+      //
+      // ── HLS / MP4 ────────────────────────────────────────────────────────────
+      // Direct CDN. MPV handles HLS/MP4 natively; headers via httpHeaders.
+      final bool isDash = streamUrl.toLowerCase().contains('.mpd');
+      final bool isHls = streamUrl.toLowerCase().contains('.m3u8');
       final String playUrl;
-      if (streamUrl.isNotEmpty) {
-        playUrl = streamUrl; // Direct CDN URL — MPV handles headers natively
+      final String fallback;
+
+      if (isDash && streamUrl.isNotEmpty) {
+        // Build the DASH proxy URL (all cookies handled server-side)
+        final dashProxyUrl = '${AppSettings.instance.backendUrl}/proxy/stream.mpd'
+            '?url=${Uri.encodeComponent(streamUrl)}'
+            '&cookie=${Uri.encodeComponent(cookie)}'
+            '&ref=${Uri.encodeComponent(referer)}';
+        playUrl  = dashProxyUrl;
+        fallback = streamUrl; // Direct CDN DASH as last resort
+      } else if (streamUrl.isNotEmpty) {
+        if (proxyUrl.isNotEmpty) {
+          // Play via local proxy to benefit from Google/Cloudflare DNS agents and abort handling
+          playUrl = proxyUrl;
+          fallback = streamUrl;
+        } else {
+          playUrl = streamUrl;
+          fallback = '';
+        }
       } else if (proxyUrl.isNotEmpty) {
-        playUrl = proxyUrl; // Fallback to proxy if no direct URL
+        playUrl  = proxyUrl;
+        fallback = '';
       } else {
         return null;
       }
@@ -323,17 +440,18 @@ class StreamResolver {
         } catch (_) {}
       }
 
-      print('[StreamResolver] [$provider] ✓ Resolved: $label${subtitleUrl.isNotEmpty ? ' [CC]' : ''}');
+      print('[StreamResolver] [$provider] ✓ Resolved: $label (${isDash ? "DASH→proxy(.mpd)" : "direct"})${subtitleUrl.isNotEmpty ? " [CC]" : ""}');
       return StreamSource(
         provider: provider,
         label: label,
         quality: quality,
         size: size,
         url: playUrl,
-        fallbackUrl: proxyUrl != playUrl ? proxyUrl : '',
+        fallbackUrl: fallback,
         referer: referer,
         subtitleUrl: subtitleUrl,
         episodeUrl: episodeUrl,
+        cookie: cookie,
       );
     } catch (e) {
       print('[StreamResolver] [$provider] Error resolving stream: $e');
@@ -353,40 +471,63 @@ class StreamResolver {
     String? seasonNumber,
     String? episodeNumber,
     int maxRefs = 999,
+    String? showUrl,
   }) async {
     try {
-      // Step 1: Search
-      final encoded = Uri.encodeComponent(title);
-      print('[StreamResolver] [$provider] Searching: $title');
-      final searchResp = await _dio.get('/search?q=$encoded&provider=$provider');
-      if (searchResp.statusCode != 200) return [];
-      final searchData = searchResp.data;
-      if (searchData?['success'] != true) return [];
-
-      final results = (searchData['results'] as List?) ?? [];
-      print('[StreamResolver] [$provider] ${results.length} results');
-      if (results.isEmpty) return [];
-
-      // Step 2: Best match
-      final cleanTitle = _clean(title);
-      Map<String, dynamic>? best;
-      int bestScore = -1;
-      for (final r in results) {
-        if (r is! Map<String, dynamic>) continue;
-        final score = _matchScore(cleanTitle, _clean(r['title']?.toString() ?? ''), year);
-        if (score > bestScore) { bestScore = score; best = r; }
+      String detailUrl = '';
+      if (showUrl != null && showUrl.isNotEmpty) {
+        final bool isMatch = switch (provider) {
+          '4khdhub'  => showUrl.contains('4khdhub') || showUrl.contains('4khd'),
+          'anidb'    => showUrl.startsWith('/anime/') || showUrl.contains('anidb'),
+          _          => false,
+        };
+        if (isMatch) {
+          detailUrl = showUrl;
+        }
       }
-      if (best == null || bestScore < 1) {
-        print('[StreamResolver] [$provider] No match (score=$bestScore)');
-        return [];
+
+      if (detailUrl.isEmpty) {
+        // Step 1: Search
+        final encoded = Uri.encodeComponent(title);
+        print('[StreamResolver] [$provider] Searching: $title');
+        final searchResp = await _dio.get('/search?q=$encoded&provider=$provider');
+        if (searchResp.statusCode != 200) return [];
+        final searchData = searchResp.data;
+        if (searchData?['success'] != true) return [];
+
+        final results = (searchData['results'] as List?) ?? [];
+        print('[StreamResolver] [$provider] ${results.length} results');
+        if (results.isEmpty) return [];
+
+        // Step 2: Best match
+        final cleanTitle = _clean(title);
+        Map<String, dynamic>? best;
+        int bestScore = -1;
+        for (final r in results) {
+          if (r is! Map<String, dynamic>) continue;
+          final score = _matchScore(cleanTitle, _clean(r['title']?.toString() ?? ''), year);
+          if (score > bestScore) { bestScore = score; best = r; }
+        }
+        if (best == null || bestScore < 40) {
+          print('[StreamResolver] [$provider] No match (score=$bestScore)');
+          return [];
+        }
+        detailUrl = best['url']?.toString() ?? '';
+        print('[StreamResolver] [$provider] Match: "${best['title']}" score=$bestScore');
       }
-      final detailUrl = best['url']?.toString() ?? '';
-      print('[StreamResolver] [$provider] Match: "${best['title']}" score=$bestScore');
+
       if (detailUrl.isEmpty) return [];
 
       // Step 3: Details
       final detailEnc = Uri.encodeComponent(detailUrl);
-      final detailResp = await _dio.get('/details?provider=$provider&url=$detailEnc');
+      final queryParams = StringBuffer('/details?provider=$provider&url=$detailEnc');
+      if (seasonNumber != null && seasonNumber.isNotEmpty) {
+        queryParams.write('&season=$seasonNumber');
+      }
+      if (episodeNumber != null && episodeNumber.isNotEmpty) {
+        queryParams.write('&episode=$episodeNumber');
+      }
+      final detailResp = await _dio.get(queryParams.toString());
       if (detailResp.statusCode != 200) return [];
       final detailData = detailResp.data;
       if (detailData?['success'] != true) return [];
@@ -448,19 +589,23 @@ class StreamResolver {
     required String mediaType,
     required String year,
     String? seasonNumber,
+    bool isAnime = false,
   }) async {
-    // Try AniDB first
-    final anidbEps = await _getProviderAllEpisodes(
-      provider: 'anidb', title: title, mediaType: mediaType,
-      year: year, seasonNumber: seasonNumber,
-    ).catchError((_) => <EpisodeRef>[]);
-    if (anidbEps.isNotEmpty) return anidbEps; // It's anime
+    // Anime: AniDB only
+    if (isAnime) {
+      final anidbEps = await _getProviderAllEpisodes(
+        provider: 'anidb', title: title, mediaType: mediaType,
+        year: year, seasonNumber: seasonNumber,
+      ).catchError((_) => <EpisodeRef>[]);
+      if (anidbEps.isNotEmpty) return anidbEps;
+    }
 
-    // Fallback to 4KHDHub for non-anime content
-    return _getProviderAllEpisodes(
+    // Non-anime: 4KHDHub only (since moviebox and hdhub are completely removed)
+    final khEps = await _getProviderAllEpisodes(
       provider: '4khdhub', title: title, mediaType: mediaType,
       year: year, seasonNumber: seasonNumber,
     ).catchError((_) => <EpisodeRef>[]);
+    return khEps;
   }
 
   /// Fetches every episode from one provider (search → best match → all episodes).
@@ -488,7 +633,7 @@ class StreamResolver {
         final score = _matchScore(cleanTitle, _clean(r['title']?.toString() ?? ''), year);
         if (score > bestScore) { bestScore = score; best = r; }
       }
-      if (best == null || bestScore < 1) return [];
+      if (best == null || bestScore < 40) return [];
       final detailUrl = best['url']?.toString() ?? '';
       if (detailUrl.isEmpty) return [];
 
@@ -538,16 +683,27 @@ class StreamResolver {
     if (candidate.isEmpty) return 0;
     if (candidate == search) return 200;
     final sWords = search.split(' ').where((w) => w.length > 1).toSet();
-    final cWords = candidate.split(' ').toSet();
+    final cWords = candidate.split(' ').where((w) => w.length > 1).toSet();
     final overlap = sWords.intersection(cWords).length;
     int score = 0;
+    // All search words match candidate = great
     if (overlap == sWords.length && sWords.isNotEmpty) score += 80;
+    // Exact substring matches
     if (candidate.contains(search)) score += 60;
-    if (search.contains(candidate)) score += 40;
+    // Candidate is a substring of search — penalize: "Spider" inside "Spider-Noir" is weak
+    if (search.contains(candidate) && candidate != search) {
+      score += 20; // reduced from 40 to 20
+      // Extra penalty if candidate is much shorter (missing words)
+      final missingWords = sWords.length - cWords.length;
+      if (missingWords > 0) score -= missingWords * 25;
+    }
     if (year.isNotEmpty && candidate.contains(year)) score += 20;
     score += overlap * 10;
+    // Penalize if candidate has far fewer words than the search (too vague a match)
+    if (cWords.length < sWords.length - 1) score -= 30;
     return score;
   }
+
 
   /// Returns ALL episode entries matching the requested season+episode number.
   /// Priority:
@@ -576,11 +732,14 @@ class StreamResolver {
 
       if (seasonRx.hasMatch(t)) {
         anyHasSeasonPattern = true;
-        // Title contains season info → require exact season+episode match
-        if (t.contains('s${sPad}e$ePad') ||
-            t.contains('s${sPad}e$e')    ||
-            t.contains('s${s}e$ePad')    ||
-            t.contains('s${s}e$e')) {
+        // Title contains season info → require EXACT season+episode match.
+        // Use regex anchored at end of number to prevent s1e1 matching s1e10, s1e181, etc.
+        // Pattern: s[0*]SeasonNum e[0*]EpNum (\D|$)
+        final epExact = RegExp(
+          r's0*' + s.toString() + r'e0*' + e.toString() + r'(\D|$)',
+          caseSensitive: false,
+        );
+        if (epExact.hasMatch(t)) {
           matchedWithSeason.add(ep);
         }
       } else {
@@ -659,4 +818,9 @@ class StreamResolver {
     if (eps.isNotEmpty) { final ep = eps.first; if (ep is Map<String, dynamic>) return ep; }
     return null;
   }
+
+  bool isProviderEnabled(String provider) {
+    return _isEnabled(provider, AppSettings.instance);
+  }
 }
+

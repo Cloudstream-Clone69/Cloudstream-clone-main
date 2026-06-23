@@ -6,19 +6,35 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:file_picker/file_picker.dart';
 
 import '../../core/services/app_settings.dart';
 import '../../core/services/local_db.dart';
 import '../../shared/theme/app_theme.dart';
+import '../../core/constants.dart';
+import '../../core/services/update_service.dart';
+import 'package:go_router/go_router.dart';
 
 // ─── Screen ───────────────────────────────────────────────────────────────────
 
 class SettingsScreen extends StatelessWidget {
-  const SettingsScreen({super.key});
+  final String? initialTab;
+  const SettingsScreen({super.key, this.initialTab});
+
+  static final tabNotifier = ValueNotifier<_Tab>(_Tab.dns);
 
   @override
   Widget build(BuildContext context) {
+    if (initialTab != null) {
+      final tab = _Tab.values.firstWhere(
+        (e) => e.name == initialTab,
+        orElse: () => _Tab.dns,
+      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        tabNotifier.value = tab;
+      });
+    }
+
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Row(
@@ -38,7 +54,7 @@ class SettingsScreen extends StatelessWidget {
 
 // ─── Side Nav ─────────────────────────────────────────────────────────────────
 
-enum _Tab { dns, playback, providers, appearance, about }
+enum _Tab { dns, playback, providers, downloads, appearance, about }
 
 class _SideNav extends StatefulWidget {
   const _SideNav();
@@ -47,18 +63,34 @@ class _SideNav extends StatefulWidget {
 }
 
 class _SideNavState extends State<_SideNav> {
-  _Tab _active = _Tab.dns;
+  @override
+  void initState() {
+    super.initState();
+    SettingsScreen.tabNotifier.addListener(_onTabChanged);
+  }
+
+  @override
+  void dispose() {
+    SettingsScreen.tabNotifier.removeListener(_onTabChanged);
+    super.dispose();
+  }
+
+  void _onTabChanged() {
+    if (mounted) setState(() {});
+  }
 
   static const _tabs = [
     (_Tab.dns,        Icons.dns_rounded,           'DNS & Network'),
     (_Tab.playback,   Icons.play_circle_outline,    'Playback'),
     (_Tab.providers,  Icons.video_library_outlined, 'Providers'),
+    (_Tab.downloads,  Icons.download_rounded,       'Downloads'),
     (_Tab.appearance, Icons.palette_outlined,       'Appearance'),
     (_Tab.about,      Icons.info_outline_rounded,   'About'),
   ];
 
   @override
   Widget build(BuildContext context) {
+    final active = SettingsScreen.tabNotifier.value;
     return Container(
       width: 220,
       decoration: const BoxDecoration(color: AppColors.surface),
@@ -80,10 +112,9 @@ class _SideNavState extends State<_SideNav> {
           ..._tabs.map((t) => _NavTab(
                 icon: t.$2,
                 label: t.$3,
-                active: _active == t.$1,
+                active: active == t.$1,
                 onTap: () {
-                  setState(() => _active = t.$1);
-                  _SettingsContentState._tabNotifier.value = t.$1;
+                  SettingsScreen.tabNotifier.value = t.$1;
                 },
               )),
           const Spacer(),
@@ -172,12 +203,10 @@ class _SettingsContent extends StatefulWidget {
 }
 
 class _SettingsContentState extends State<_SettingsContent> {
-  static final _tabNotifier = ValueNotifier<_Tab>(_Tab.dns);
-
   @override
   Widget build(BuildContext context) {
     return ValueListenableBuilder<_Tab>(
-      valueListenable: _tabNotifier,
+      valueListenable: SettingsScreen.tabNotifier,
       builder: (context, tab, _) {
         return AnimatedSwitcher(
           duration: const Duration(milliseconds: 200),
@@ -187,6 +216,7 @@ class _SettingsContentState extends State<_SettingsContent> {
               _Tab.dns        => const _DnsSection(),
               _Tab.playback   => const _PlaybackSection(),
               _Tab.providers  => const _ProvidersSection(),
+              _Tab.downloads  => const _DownloadsSection(),
               _Tab.appearance => const _AppearanceSection(),
               _Tab.about      => const _AboutSection(),
             },
@@ -617,7 +647,10 @@ class _DnsSectionState extends State<_DnsSection> {
                         final ok = await s.enableWarp();
                         if (mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                            content: Text(ok ? '✓ WARP connected — streams will work now!' : '✗ WARP failed to connect. Is the 1.1.1.1 app installed?'),
+                            content: Text(
+                              ok ? '✓ WARP connected — streams will work now!' : '✗ WARP failed to connect. Is the 1.1.1.1 app installed?',
+                              style: GoogleFonts.inter(color: Colors.white, fontSize: 12),
+                            ),
                             backgroundColor: ok ? Colors.green.shade800 : Colors.red.shade900,
                             duration: const Duration(seconds: 4),
                           ));
@@ -677,7 +710,7 @@ class _DnsSectionState extends State<_DnsSection> {
           controller: ctrl,
           style: GoogleFonts.inter(color: Colors.white),
           decoration: InputDecoration(
-            hintText: 'http://localhost:3000',
+            hintText: 'https://cloudstream-clone-main.onrender.com',
             hintStyle: GoogleFonts.inter(color: AppColors.tertiary),
           ),
         ),
@@ -1105,16 +1138,29 @@ class _ProvidersSection extends StatelessWidget {
             onChanged: s.setEnableAniDb,
             icon: Icons.play_circle_filled_rounded,
           ),
-          _ProviderTile(
-            name: 'AniDAO',
-            description: 'Alternative anime source',
-            badgeText: 'Sub',
-            badgeColor: Colors.lightBlue,
-            enabled: s.enableAniDao,
-            onChanged: s.setEnableAniDao,
-            icon: Icons.animation_rounded,
-          ),
         ]),
+
+        const SizedBox(height: 24),
+        _SectionTitle('Source Priority',
+            subtitle: 'Drag to set which provider is tried first'),
+
+        _GroupLabel('Movies'),
+        _PriorityReorder(
+          order: s.movieProviderOrder,
+          onReorder: s.setMovieProviderOrder,
+        ),
+        const SizedBox(height: 16),
+        _GroupLabel('TV Series'),
+        _PriorityReorder(
+          order: s.seriesProviderOrder,
+          onReorder: s.setSeriesProviderOrder,
+        ),
+        const SizedBox(height: 16),
+        _GroupLabel('Anime'),
+        _PriorityReorder(
+          order: s.animeProviderOrder,
+          onReorder: s.setAnimeProviderOrder,
+        ),
 
         const SizedBox(height: 16),
         Container(
@@ -1128,7 +1174,7 @@ class _ProvidersSection extends StatelessWidget {
             const Icon(Icons.info_outline_rounded, color: Colors.lightBlue, size: 18),
             const SizedBox(width: 10),
             Expanded(child: Text(
-              'Provider changes take effect on the next search or stream. Anime content always uses AniDB/AniDAO; non-anime uses 4KHD Hub.',
+              'All enabled providers in the priority list are raced. The first one to return a valid stream plays immediately. Disabled providers are skipped.',
               style: GoogleFonts.inter(color: Colors.lightBlue, fontSize: 11, height: 1.5),
             )),
           ]),
@@ -1137,6 +1183,152 @@ class _ProvidersSection extends StatelessWidget {
     });
   }
 }
+// ─── Priority Reorder Widget ─────────────────────────────────────────────────
+
+// Provider display metadata
+const _kProviderMeta = <String, ({String name, IconData icon, Color color})>{
+  '4khdhub':  (name: '4KHD Hub',  icon: Icons.movie_filter_rounded,        color: Color(0xFF69F0AE)),
+  'anidb':    (name: 'AniDB',     icon: Icons.play_circle_filled_rounded,   color: Colors.amber),
+};
+
+class _PriorityReorder extends StatefulWidget {
+  final List<String> order;
+  final void Function(List<String>) onReorder;
+  const _PriorityReorder({required this.order, required this.onReorder});
+
+  @override
+  State<_PriorityReorder> createState() => _PriorityReorderState();
+}
+
+class _PriorityReorderState extends State<_PriorityReorder> {
+  late List<String> _order;
+
+  @override
+  void initState() {
+    super.initState();
+    _order = List<String>.from(widget.order);
+  }
+
+  @override
+  void didUpdateWidget(_PriorityReorder old) {
+    super.didUpdateWidget(old);
+    if (old.order.join() != widget.order.join()) {
+      _order = List<String>.from(widget.order);
+    }
+  }
+
+  void _move(int from, int to) {
+    if (to < 0 || to >= _order.length) return;
+    setState(() {
+      final item = _order.removeAt(from);
+      _order.insert(to, item);
+    });
+    widget.onReorder(List<String>.from(_order));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        for (int i = 0; i < _order.length; i++) _buildRow(i),
+      ],
+    );
+  }
+
+  Widget _buildRow(int idx) {
+    final id   = _order[idx];
+    final meta = _kProviderMeta[id];
+    if (meta == null) return const SizedBox.shrink();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A2E),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        child: Row(
+          children: [
+            // Priority number badge
+            Container(
+              width: 26, height: 26,
+              decoration: BoxDecoration(
+                color: idx == 0
+                    ? meta.color.withValues(alpha: 0.20)
+                    : Colors.white.withValues(alpha: 0.05),
+                shape: BoxShape.circle,
+              ),
+              alignment: Alignment.center,
+              child: Text('${idx + 1}',
+                  style: GoogleFonts.inter(
+                    fontSize: 12, fontWeight: FontWeight.w700,
+                    color: idx == 0 ? meta.color : AppColors.tertiary,
+                  )),
+            ),
+            const SizedBox(width: 12),
+            Icon(meta.icon, size: 18, color: meta.color),
+            const SizedBox(width: 10),
+            Expanded(child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(meta.name,
+                    style: GoogleFonts.inter(
+                        color: Colors.white, fontSize: 13,
+                        fontWeight: FontWeight.w600)),
+                if (idx == 0)
+                  Text('Tried first — fastest wins',
+                      style: GoogleFonts.inter(
+                          color: meta.color.withValues(alpha: 0.7),
+                          fontSize: 10)),
+              ],
+            )),
+            // Up / Down buttons
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _ArrowBtn(
+                    icon: Icons.keyboard_arrow_up_rounded,
+                    enabled: idx > 0,
+                    onTap: () => _move(idx, idx - 1)),
+                const SizedBox(height: 2),
+                _ArrowBtn(
+                    icon: Icons.keyboard_arrow_down_rounded,
+                    enabled: idx < _order.length - 1,
+                    onTap: () => _move(idx, idx + 1)),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ArrowBtn extends StatelessWidget {
+  final IconData icon;
+  final bool enabled;
+  final VoidCallback onTap;
+  const _ArrowBtn({required this.icon, required this.enabled, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+    onTap: enabled ? onTap : null,
+    child: Container(
+      width: 26, height: 26,
+      decoration: BoxDecoration(
+        color: enabled ? AppColors.surfaceHigh : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      alignment: Alignment.center,
+      child: Icon(icon, size: 16,
+          color: enabled ? Colors.white : Colors.white24),
+    ),
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 class _ProviderTile extends StatelessWidget {
   final String name;
@@ -1377,6 +1569,59 @@ class _AboutSectionState extends State<_AboutSection> {
         false;
   }
 
+  Future<void> _checkUpdates(BuildContext context) async {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (d) => const Center(
+        child: CircularProgressIndicator(color: AppColors.accent),
+      ),
+    );
+
+    try {
+      final info = await UpdateService.instance.checkUpdate();
+      if (mounted) Navigator.pop(context); // Close loading spinner
+
+      if (info == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Failed to check for updates. Please try again.',
+                style: GoogleFonts.inter(color: Colors.white)),
+            backgroundColor: Colors.redAccent,
+          ));
+        }
+        return;
+      }
+
+      final updateAvailable = UpdateService.instance.isUpdateAvailable(kAppVersion, info.latestVersion);
+      if (updateAvailable) {
+        if (mounted) {
+          context.push('/update', extra: {
+            'info': info,
+            'mandatory': info.mandatory,
+          });
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('You are already on the latest version ($kAppVersion)',
+                style: GoogleFonts.inter(color: Colors.white)),
+            backgroundColor: const Color(0xFF1A3326),
+          ));
+        }
+      }
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Error checking for updates: $e',
+              style: GoogleFonts.inter(color: Colors.white)),
+          backgroundColor: Colors.redAccent,
+        ));
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) => _SectionScroll(children: [
         _SectionTitle('About'),
@@ -1420,7 +1665,7 @@ class _AboutSectionState extends State<_AboutSection> {
                         color: Colors.white,
                         fontSize: 20,
                         fontWeight: FontWeight.w800)),
-                Text('Version 1.0.0 · Windows',
+                Text('Version $kAppVersion · Windows',
                     style: GoogleFonts.inter(
                         color: AppColors.secondary, fontSize: 12)),
                 const SizedBox(height: 4),
@@ -1431,6 +1676,20 @@ class _AboutSectionState extends State<_AboutSection> {
             ],
           ),
         ),
+
+        const SizedBox(height: 24),
+        _GroupLabel('App Update'),
+        _Card(children: [
+          _InfoTile(
+            icon: Icons.system_update_rounded,
+            iconColor: AppColors.accent,
+            label: 'Check for Updates',
+            value: '',
+            subtitle: 'Check for new releases and install them directly',
+            onTap: () => _checkUpdates(context),
+            trailing: const Icon(Icons.chevron_right_rounded, color: AppColors.secondary),
+          ),
+        ]),
 
         const SizedBox(height: 24),
         _GroupLabel('Data Management'),
@@ -1498,4 +1757,308 @@ class _AboutSectionState extends State<_AboutSection> {
           ),
         ]),
       ]);
+}
+
+class _DownloadsSection extends StatelessWidget {
+  const _DownloadsSection();
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<AppSettings>(builder: (ctx, s, _) {
+      return _SectionScroll(children: [
+        _SectionTitle('Downloads',
+            subtitle: 'Configure off-line viewing preferences, paths, and automation'),
+
+        _GroupLabel('Smart Downloads'),
+        _Card(children: [
+          _ToggleTile(
+            icon: Icons.skip_next_rounded,
+            iconColor: AppColors.accent,
+            label: 'Auto-download Next Episode',
+            subtitle: 'Automatically download the next episode when you finish the current one',
+            value: s.autoDownloadNext,
+            onChanged: s.setAutoDownloadNext,
+          ),
+          _ToggleTile(
+            icon: Icons.delete_outline_rounded,
+            iconColor: Colors.orange,
+            label: 'Auto-delete Completed Episodes',
+            subtitle: 'Delete episodes 24 hours after you finish watching them',
+            value: s.autoDeleteWatched,
+            onChanged: s.setAutoDeleteWatched,
+          ),
+        ]),
+
+        const SizedBox(height: 20),
+        _GroupLabel('Download Directory'),
+        _Card(children: [
+          _DownloadPathCard(
+            path: s.downloadPath,
+            onChanged: s.setDownloadPath,
+          ),
+        ]),
+
+        const SizedBox(height: 20),
+        _GroupLabel('Performance Settings'),
+        _Card(children: [
+          _DropdownTile<int>(
+            icon: Icons.content_copy_rounded,
+            iconColor: Colors.purple,
+            label: 'Simultaneous Downloads',
+            subtitle: s.simultaneousDownloads == 1
+                ? 'Download files sequentially (Recommended)'
+                : 'Download up to ${s.simultaneousDownloads} files in parallel',
+            value: s.simultaneousDownloads,
+            items: List.generate(10, (i) => i + 1),
+            itemLabelBuilder: (val) => '$val',
+            onChanged: (val) {
+              if (val != null) s.setSimultaneousDownloads(val);
+            },
+          ),
+          _DropdownTile<int>(
+            icon: Icons.speed_rounded,
+            iconColor: Colors.tealAccent,
+            label: 'Connection Threads per File',
+            subtitle: 'Download using ${s.downloadThreads} parallel connection threads per file',
+            value: s.downloadThreads,
+            items: List.generate(10, (i) => i + 1),
+            itemLabelBuilder: (val) => '$val',
+            onChanged: (val) {
+              if (val != null) s.setDownloadThreads(val);
+            },
+          ),
+        ]),
+      ]);
+    });
+  }
+}
+
+class _DownloadPathCard extends StatefulWidget {
+  final String path;
+  final ValueChanged<String> onChanged;
+  const _DownloadPathCard({required this.path, required this.onChanged});
+
+  @override
+  State<_DownloadPathCard> createState() => _DownloadPathCardState();
+}
+
+class _DownloadPathCardState extends State<_DownloadPathCard> {
+  late TextEditingController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = TextEditingController(text: widget.path);
+  }
+
+  @override
+  void didUpdateWidget(covariant _DownloadPathCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.path != widget.path) {
+      _ctrl.text = widget.path;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.folder_open_rounded, color: Colors.blueAccent, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Download Folder Path',
+                      style: GoogleFonts.inter(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      'Leave blank to use default documents directory',
+                      style: GoogleFonts.inter(color: AppColors.tertiary, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _ctrl,
+                  style: GoogleFonts.inter(color: Colors.white, fontSize: 12),
+                  onSubmitted: widget.onChanged,
+                  decoration: InputDecoration(
+                    hintText: 'Default: Documents/CloudStream/Downloads',
+                    hintStyle: GoogleFonts.inter(color: Colors.white24, fontSize: 12),
+                    filled: true,
+                    fillColor: AppColors.surface,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: BorderSide(color: AppColors.cardBorder, width: 0.5),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: BorderSide(color: AppColors.accent, width: 1.0),
+                    ),
+                    suffixIcon: IconButton(
+                      icon: const Icon(Icons.check_rounded, color: AppColors.accent, size: 18),
+                      onPressed: () => widget.onChanged(_ctrl.text.trim()),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              ElevatedButton.icon(
+                onPressed: () async {
+                  try {
+                    String? path = await FilePicker.platform.getDirectoryPath();
+                    if (path != null) {
+                      setState(() {
+                        _ctrl.text = path;
+                      });
+                      widget.onChanged(path);
+                    }
+                  } catch (e) {
+                    debugPrint('Error picking directory: $e');
+                  }
+                },
+                icon: const Icon(Icons.search_rounded, size: 16, color: Colors.white),
+                label: Text('Browse', style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.surfaceHigh,
+                  foregroundColor: Colors.white,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    side: const BorderSide(color: AppColors.cardBorder, width: 0.5),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DropdownTile<T> extends StatelessWidget {
+  final IconData icon;
+  final Color iconColor;
+  final String label;
+  final String? subtitle;
+  final T value;
+  final List<T> items;
+  final String Function(T) itemLabelBuilder;
+  final ValueChanged<T?> onChanged;
+
+  const _DropdownTile({
+    required this.icon,
+    required this.iconColor,
+    required this.label,
+    this.subtitle,
+    required this.value,
+    required this.items,
+    required this.itemLabelBuilder,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: [
+          Container(
+            width: 32,
+            height: 32,
+            decoration: BoxDecoration(
+              color: iconColor.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, size: 16, color: iconColor),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: GoogleFonts.inter(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+                if (subtitle != null)
+                  Text(
+                    subtitle!,
+                    style: GoogleFonts.inter(
+                      color: AppColors.tertiary,
+                      fontSize: 11,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 16),
+          Theme(
+            data: Theme.of(context).copyWith(
+              canvasColor: AppColors.surfaceHigh,
+            ),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+              decoration: BoxDecoration(
+                color: AppColors.surface,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AppColors.cardBorder, width: 0.5),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<T>(
+                  value: value,
+                  items: items
+                      .map((item) => DropdownMenuItem<T>(
+                            value: item,
+                            child: Text(
+                              itemLabelBuilder(item),
+                              style: GoogleFonts.inter(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ))
+                      .toList(),
+                  onChanged: onChanged,
+                  icon: const Icon(
+                    Icons.arrow_drop_down_rounded,
+                    color: AppColors.secondary,
+                  ),
+                  dropdownColor: AppColors.surfaceHigh,
+                  style: GoogleFonts.inter(color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

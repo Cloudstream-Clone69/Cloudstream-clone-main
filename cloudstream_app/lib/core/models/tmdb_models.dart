@@ -1,8 +1,7 @@
 // lib/core/models/tmdb_models.dart
 
 class TmdbItem {
-  final int id;           // TMDB ID — used for stream resolution
-  final int simklId;      // SIMKL ID — used for SIMKL API calls (0 if from TMDB)
+  final int id;
   final String title;
   final String posterPath;
   final String backdropPath;
@@ -15,7 +14,6 @@ class TmdbItem {
 
   TmdbItem({
     required this.id,
-    this.simklId = 0,
     required this.title,
     required this.posterPath,
     required this.backdropPath,
@@ -62,9 +60,7 @@ class TmdbItem {
 }
 
 class TmdbDetail {
-  final int id;           // TMDB ID — used for stream resolution
-  final int simklId;      // SIMKL ID — used for SIMKL API calls (0 if from TMDB)
-  final String imdbId;    // IMDB ID — used for TVMaze episode lookup
+  final int id;
   final String title;
   final String overview;
   final String backdropPath;
@@ -78,8 +74,6 @@ class TmdbDetail {
 
   TmdbDetail({
     required this.id,
-    this.simklId = 0,
-    this.imdbId = '',
     required this.title,
     required this.overview,
     required this.backdropPath,

@@ -120,7 +120,6 @@ class SimklApi {
 
     return TmdbItem(
       id: tmdbId > 0 ? tmdbId : simklId,
-      simklId: simklId,
       title: _toStr(j['title']),
       posterPath: posterUrl(_toStr(j['poster'])),
       backdropPath: fanartUrl(_toStr(j['fanart'])),
@@ -154,7 +153,7 @@ class SimklApi {
       return (r.data as List)
           .whereType<Map<String, dynamic>>()
           .map((j) => _toItem(j, forceType: forceType))
-          .where((i) => i.simklId > 0 && i.title.isNotEmpty)
+          .where((i) => i.id > 0 && i.title.isNotEmpty)
           .toList();
     }
     throw Exception('SIMKL: bad response $path → ${r.statusCode}');
@@ -172,7 +171,7 @@ class SimklApi {
     final seen = <int>{};
     return lists
         .expand((l) => l)
-        .where((i) => i.simklId > 0 && seen.add(i.simklId))
+        .where((i) => i.id > 0 && seen.add(i.id))
         .toList();
   }
 
@@ -184,7 +183,7 @@ class SimklApi {
         return (r.data as List)
             .whereType<Map<String, dynamic>>()
             .map((j) => _toItem(j, forceType: type))
-            .where((i) => i.simklId > 0)
+            .where((i) => i.id > 0)
             .toList();
       }
     } catch (_) {}
@@ -265,8 +264,6 @@ class SimklApi {
 
     return TmdbDetail(
       id: tmdbId > 0 ? tmdbId : simklId,
-      simklId: simklId,
-      imdbId: imdbId,
       title: title,
       overview: _toStr(j['overview']),
       backdropPath: fanartUrl(_toStr(j['fanart'])),

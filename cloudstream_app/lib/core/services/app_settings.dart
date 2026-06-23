@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:dio/dio.dart';
+import '../constants.dart';
 
 // ── DNS Preset Model ─────────────────────────────────────────────────────────
 
@@ -86,7 +87,7 @@ class AppSettings extends ChangeNotifier {
   static final instance = AppSettings._();
 
   final _dio = Dio(BaseOptions(
-    baseUrl: 'http://localhost:3000',
+    baseUrl: kBaseUrl,
     connectTimeout: const Duration(seconds: 5),
     receiveTimeout: const Duration(seconds: 5),
     validateStatus: (_) => true,
@@ -132,21 +133,45 @@ class AppSettings extends ChangeNotifier {
   bool _autoPlayNext = true;
   bool _pauseOnFocusLoss = true;
   int _bufferSeconds = 30;            // 5 | 15 | 30 | 60
+  bool _autoDownloadNext = true;
+  bool _autoDeleteWatched = false;
+  int _simultaneousDownloads = 1;
+  int _downloadThreads = 4;
+  String _downloadPath = '';
 
   String get preferredQuality => _preferredQuality;
   String get preferredLang => _preferredLang;
   bool get autoPlayNext => _autoPlayNext;
   bool get pauseOnFocusLoss => _pauseOnFocusLoss;
   int get bufferSeconds => _bufferSeconds;
+  bool get autoDownloadNext => _autoDownloadNext;
+  bool get autoDeleteWatched => _autoDeleteWatched;
+  int get simultaneousDownloads => _simultaneousDownloads;
+  int get downloadThreads => _downloadThreads;
+  String get downloadPath => _downloadPath;
 
   // ── Providers ────────────────────────────────────────────────────────────
   bool _enable4kHdHub = true;
+  bool _enableHdHub = false;
   bool _enableAniDb = true;
-  bool _enableAniDao = true;
+  bool _enableAniDao = false;
+  bool _enableMovieBox = false;
 
-  bool get enable4kHdHub => _enable4kHdHub;
-  bool get enableAniDb => _enableAniDb;
-  bool get enableAniDao => _enableAniDao;
+  bool get enable4kHdHub  => _enable4kHdHub;
+  bool get enableHdHub    => _enableHdHub;
+  bool get enableAniDb    => _enableAniDb;
+  bool get enableAniDao   => _enableAniDao;
+  bool get enableMovieBox => _enableMovieBox;
+
+  // Source priority orders — first element = highest priority (tried first)
+  // These are stored as JSON strings in SharedPreferences.
+  List<String> _movieProviderOrder  = const ['4khdhub', 'anidb'];
+  List<String> _seriesProviderOrder = const ['4khdhub', 'anidb'];
+  List<String> _animeProviderOrder  = const ['anidb', '4khdhub'];
+
+  List<String> get movieProviderOrder  => List.unmodifiable(_movieProviderOrder);
+  List<String> get seriesProviderOrder => List.unmodifiable(_seriesProviderOrder);
+  List<String> get animeProviderOrder  => List.unmodifiable(_animeProviderOrder);
 
   // ── Appearance ───────────────────────────────────────────────────────────
   String _accentColorHex = 'E50914'; // Netflix red
@@ -155,7 +180,7 @@ class AppSettings extends ChangeNotifier {
   Color get accentColor => Color(int.parse('FF$_accentColorHex', radix: 16));
 
   // ── Backend ───────────────────────────────────────────────────────────────
-  String _backendUrl = 'http://localhost:3000';
+  String _backendUrl = kBaseUrl;
   String get backendUrl => _backendUrl;
 
   // ── Init ──────────────────────────────────────────────────────────────────
@@ -176,11 +201,27 @@ class AppSettings extends ChangeNotifier {
     _autoPlayNext       = prefs.getBool('auto_play_next') ?? true;
     _pauseOnFocusLoss   = prefs.getBool('pauseOnFocusLoss') ?? true;
     _bufferSeconds      = prefs.getInt('buffer_seconds') ?? 30;
+    _autoDownloadNext   = prefs.getBool('auto_download_next') ?? true;
+    _autoDeleteWatched  = prefs.getBool('auto_delete_watched') ?? false;
+    _simultaneousDownloads = prefs.getInt('simultaneous_downloads') ?? 1;
+    _downloadThreads    = prefs.getInt('download_threads') ?? 4;
+    _downloadPath       = prefs.getString('download_path') ?? '';
     _enable4kHdHub      = prefs.getBool('enable_4khdhub') ?? true;
+    _enableHdHub        = prefs.getBool('enable_hdhub') ?? false;
     _enableAniDb        = prefs.getBool('enable_anidb') ?? true;
-    _enableAniDao       = prefs.getBool('enable_anidao') ?? true;
+    _enableAniDao       = prefs.getBool('enable_anidao') ?? false;
+    _enableMovieBox     = prefs.getBool('enable_moviebox') ?? false;
+    // Priority orders
+    _movieProviderOrder  = _decodeOrder(prefs.getString('movie_provider_order'),  ['4khdhub', 'anidb']);
+    _seriesProviderOrder = _decodeOrder(prefs.getString('series_provider_order'), ['4khdhub', 'anidb']);
+    _animeProviderOrder  = _decodeOrder(prefs.getString('anime_provider_order'),  ['anidb', '4khdhub']);
     _accentColorHex     = prefs.getString('accent_color') ?? 'E50914';
-    _backendUrl         = prefs.getString('backend_url') ?? 'http://localhost:3000';
+    _backendUrl         = prefs.getString('backend_url') ?? kBaseUrl;
+    if (_backendUrl == 'http://localhost:3000') {
+      _backendUrl = kBaseUrl;
+      await prefs.setString('backend_url', _backendUrl);
+    }
+    _dio.options.baseUrl = _backendUrl;
   }
 
   Future<void> _save() async {
@@ -193,9 +234,19 @@ class AppSettings extends ChangeNotifier {
     await prefs.setBool('auto_play_next', _autoPlayNext);
     await prefs.setBool('pauseOnFocusLoss', _pauseOnFocusLoss);
     await prefs.setInt('buffer_seconds', _bufferSeconds);
+    await prefs.setBool('auto_download_next', _autoDownloadNext);
+    await prefs.setBool('auto_delete_watched', _autoDeleteWatched);
+    await prefs.setInt('simultaneous_downloads', _simultaneousDownloads);
+    await prefs.setInt('download_threads', _downloadThreads);
+    await prefs.setString('download_path', _downloadPath);
     await prefs.setBool('enable_4khdhub', _enable4kHdHub);
+    await prefs.setBool('enable_hdhub', _enableHdHub);
     await prefs.setBool('enable_anidb', _enableAniDb);
     await prefs.setBool('enable_anidao', _enableAniDao);
+    await prefs.setBool('enable_moviebox', _enableMovieBox);
+    await prefs.setString('movie_provider_order',  jsonEncode(_movieProviderOrder));
+    await prefs.setString('series_provider_order', jsonEncode(_seriesProviderOrder));
+    await prefs.setString('anime_provider_order',  jsonEncode(_animeProviderOrder));
     await prefs.setString('accent_color', _accentColorHex);
     await prefs.setString('backend_url', _backendUrl);
   }
@@ -331,6 +382,13 @@ class AppSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setEnableHdHub(bool v) async {
+    _enableHdHub = v;
+    await _save();
+    await _syncProviders();
+    notifyListeners();
+  }
+
   Future<void> setEnableAniDb(bool v) async {
     _enableAniDb = v;
     await _save();
@@ -345,6 +403,61 @@ class AppSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> setEnableMovieBox(bool v) async {
+    _enableMovieBox = v;
+    await _save();
+    await _syncProviders();
+    notifyListeners();
+  }
+
+  Future<void> setMovieProviderOrder(List<String> order) async {
+    _movieProviderOrder = List<String>.from(order);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setSeriesProviderOrder(List<String> order) async {
+    _seriesProviderOrder = List<String>.from(order);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setAnimeProviderOrder(List<String> order) async {
+    _animeProviderOrder = List<String>.from(order);
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setAutoDownloadNext(bool v) async {
+    _autoDownloadNext = v;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setAutoDeleteWatched(bool v) async {
+    _autoDeleteWatched = v;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setSimultaneousDownloads(int v) async {
+    _simultaneousDownloads = v;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setDownloadThreads(int v) async {
+    _downloadThreads = v;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> setDownloadPath(String v) async {
+    _downloadPath = v;
+    await _save();
+    notifyListeners();
+  }
+
   Future<void> _syncProviders() async {
     try {
       await _dio.post('/api/settings/providers',
@@ -352,11 +465,27 @@ class AppSettings extends ChangeNotifier {
             'providers': {
               '4khdhub': _enable4kHdHub,
               'anidb': _enableAniDb,
-              'anidao': _enableAniDao,
             }
           }),
           options: Options(contentType: 'application/json'));
     } catch (_) {}
+  }
+
+  // ── Helper ────────────────────────────────────────────────────────────────
+  static List<String> _decodeOrder(String? raw, List<String> defaultOrder) {
+    if (raw == null || raw.isEmpty) return List<String>.from(defaultOrder);
+    try {
+      final list = (jsonDecode(raw) as List).cast<String>();
+      // Only keep items that are in defaultOrder
+      final filtered = list.where((p) => defaultOrder.contains(p)).toList();
+      // Add any missing defaultOrder providers at the end
+      for (final p in defaultOrder) {
+        if (!filtered.contains(p)) filtered.add(p);
+      }
+      return filtered.isNotEmpty ? filtered : List<String>.from(defaultOrder);
+    } catch (_) {
+      return List<String>.from(defaultOrder);
+    }
   }
 
   // ── Appearance ────────────────────────────────────────────────────────────
@@ -371,6 +500,7 @@ class AppSettings extends ChangeNotifier {
 
   Future<void> setBackendUrl(String url) async {
     _backendUrl = url.trim();
+    _dio.options.baseUrl = _backendUrl;
     await _save();
     notifyListeners();
   }

@@ -8,7 +8,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:shimmer/shimmer.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-import '../../core/models/tmdb_models.dart';
+import '../../core/models/search_result.dart';
 import '../../shared/theme/app_theme.dart';
 import 'search_provider.dart';
 
@@ -38,16 +38,12 @@ class _SearchScreenState extends State<SearchScreen> {
     super.dispose();
   }
 
-  void _openDetail(BuildContext ctx, TmdbItem item) {
+  void _openDetail(BuildContext ctx, SearchResult item) {
     ctx.push('/detail', extra: {
-      'id': item.id,
-      'simklId': item.simklId,
-      'mediaType': item.mediaType,
       'title': item.title,
-      'poster': item.posterUrl,
-      'backdrop': item.backdropUrl,
-      'overview': item.overview,
-      'releaseDate': item.releaseDate,
+      'poster': item.poster ?? '',
+      'provider': item.provider,
+      'providerUrl': item.url,
     });
   }
 
@@ -62,25 +58,97 @@ class _SearchScreenState extends State<SearchScreen> {
             onChanged: sp.onQueryChanged,
             onClear: () { _ctrl.clear(); sp.clear(); },
           ),
-          Expanded(child: switch (sp.status) {
-            SearchStatus.idle    => _buildIdle(ctx),
-            SearchStatus.loading => _buildLoading(),
-            SearchStatus.error   => _buildError(ctx, sp),
-            SearchStatus.loaded  => _buildResults(ctx, sp),
-          }),
+          Expanded(
+            child: sp.query.isNotEmpty && sp.suggestions.isNotEmpty && sp.status == SearchStatus.idle
+                ? _buildSuggestions(ctx, sp)
+                : switch (sp.status) {
+                    SearchStatus.idle    => _buildIdle(ctx, sp),
+                    SearchStatus.loading => _buildLoading(),
+                    SearchStatus.error   => _buildError(ctx, sp),
+                    SearchStatus.loaded  => _buildResults(ctx, sp),
+                  },
+          ),
         ]),
       );
     });
   }
 
-  Widget _buildIdle(BuildContext ctx) {
-    return Center(
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        const Icon(Icons.search_rounded, color: AppColors.tertiary, size: 56),
-        const SizedBox(height: 14),
-        Text('Search movies, series and anime',
-          style: GoogleFonts.inter(color: AppColors.tertiary, fontSize: 14)),
-      ]),
+  Widget _buildIdle(BuildContext ctx, SearchProvider sp) {
+    if (sp.history.isEmpty) {
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.search_rounded, color: AppColors.tertiary, size: 56),
+          const SizedBox(height: 14),
+          Text('Search movies, series and anime',
+            style: GoogleFonts.inter(color: AppColors.tertiary, fontSize: 14)),
+        ]),
+      );
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.history_rounded, color: AppColors.secondary, size: 18),
+              const SizedBox(width: 8),
+              Text(
+                'RECENT SEARCHES',
+                style: GoogleFonts.inter(
+                  color: AppColors.secondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: () => sp.clearHistory(),
+                child: Text(
+                  'Clear All',
+                  style: GoogleFonts.inter(
+                    color: AppColors.accent,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: sp.history.map((q) => _SearchHistoryChip(
+              query: q,
+              onTap: () {
+                _ctrl.text = q;
+                sp.executeSearch(q);
+              },
+              onDelete: () => sp.deleteHistoryItem(q),
+            )).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSuggestions(BuildContext ctx, SearchProvider sp) {
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: sp.suggestions.length,
+      itemBuilder: (context, idx) {
+        final sug = sp.suggestions[idx];
+        return _SearchSuggestionTile(
+          suggestion: sug,
+          onTap: () {
+            _ctrl.text = sug;
+            sp.executeSearch(sug);
+          },
+        );
+      },
     );
   }
 
@@ -141,7 +209,8 @@ class _SearchScreenState extends State<SearchScreen> {
   }
 
   Widget _buildResults(BuildContext ctx, SearchProvider sp) {
-    if (sp.results.isEmpty) {
+    final sections = sp.results.where((s) => s.results.isNotEmpty).toList();
+    if (sections.isEmpty) {
       return Center(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
           const Icon(Icons.search_off_rounded, color: AppColors.tertiary, size: 48),
@@ -152,19 +221,57 @@ class _SearchScreenState extends State<SearchScreen> {
       );
     }
 
-    return GridView.builder(
-      padding: const EdgeInsets.all(20),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 130,
-        childAspectRatio: 110 / 190,
-        crossAxisSpacing: 10,
-        mainAxisSpacing: 20,
-      ),
-      itemCount: sp.results.length,
-      itemBuilder: (ctx, i) {
-        return _SearchCard(
-          item: sp.results[i],
-          onTap: () => _openDetail(ctx, sp.results[i]),
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      itemCount: sections.length,
+      itemBuilder: (context, idx) {
+        final section = sections[idx];
+        final providerLabel = switch (section.provider.toLowerCase()) {
+          'anidb'    => 'AniDB',
+          '4khdhub'  => '4KHD Hub',
+          final other => other.isNotEmpty ? '${other[0].toUpperCase()}${other.substring(1)}' : '',
+        };
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 28),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
+                child: Row(children: [
+                  Text(
+                    providerLabel,
+                    style: GoogleFonts.inter(
+                      color: AppColors.primary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Icon(Icons.arrow_forward_rounded, color: AppColors.accent, size: 16),
+                ]),
+              ),
+              SizedBox(
+                height: 198,
+                child: ListView.builder(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                  itemCount: section.results.length,
+                  itemBuilder: (ctx, i) {
+                    final item = section.results[i];
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 10),
+                      child: _ProviderSearchCard(
+                        item: item,
+                        onTap: () => _openDetail(ctx, item),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
@@ -232,18 +339,18 @@ class _SearchBar extends StatelessWidget {
   }
 }
 
-// ─── Search Card ──────────────────────────────────────────────────────────────
+// ─── Provider Search Card ──────────────────────────────────────────────────────
 
-class _SearchCard extends StatefulWidget {
-  final TmdbItem item;
+class _ProviderSearchCard extends StatefulWidget {
+  final SearchResult item;
   final VoidCallback onTap;
-  const _SearchCard({required this.item, required this.onTap});
+  const _ProviderSearchCard({required this.item, required this.onTap});
 
   @override
-  State<_SearchCard> createState() => _SearchCardState();
+  State<_ProviderSearchCard> createState() => _ProviderSearchCardState();
 }
 
-class _SearchCardState extends State<_SearchCard> {
+class _ProviderSearchCardState extends State<_ProviderSearchCard> {
   bool _h = false;
 
   @override
@@ -276,9 +383,9 @@ class _SearchCardState extends State<_SearchCard> {
               ),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(15),
-                child: widget.item.posterUrl.isNotEmpty
+                child: (widget.item.poster ?? '').isNotEmpty
                     ? CachedNetworkImage(
-                        imageUrl: widget.item.posterUrl,
+                        imageUrl: widget.item.poster!,
                         fit: BoxFit.cover,
                         placeholder: (_, __) => _shimmer(),
                         errorWidget: (_, __, ___) => _placeholder(),
@@ -315,3 +422,112 @@ class _SearchCardState extends State<_SearchCard> {
     child: const Center(child: Icon(Icons.movie_outlined, color: AppColors.tertiary, size: 28)),
   );
 }
+
+// ─── Search History & Suggestions UI Helpers ─────────────────────────────────
+
+class _SearchHistoryChip extends StatefulWidget {
+  final String query;
+  final VoidCallback onTap;
+  final VoidCallback onDelete;
+  const _SearchHistoryChip({required this.query, required this.onTap, required this.onDelete});
+
+  @override
+  State<_SearchHistoryChip> createState() => _SearchHistoryChipState();
+}
+
+class _SearchHistoryChipState extends State<_SearchHistoryChip> {
+  bool _h = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _h = true),
+      onExit: (_) => setState(() => _h = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: _h ? AppColors.surfaceHigh : AppColors.surface,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: AppColors.cardBorder, width: 0.5),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                widget.query,
+                style: GoogleFonts.inter(
+                  color: AppColors.primary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: () {
+                  widget.onDelete();
+                },
+                child: const Icon(
+                  Icons.close_rounded,
+                  color: AppColors.tertiary,
+                  size: 14,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SearchSuggestionTile extends StatefulWidget {
+  final String suggestion;
+  final VoidCallback onTap;
+  const _SearchSuggestionTile({required this.suggestion, required this.onTap});
+
+  @override
+  State<_SearchSuggestionTile> createState() => _SearchSuggestionTileState();
+}
+
+class _SearchSuggestionTileState extends State<_SearchSuggestionTile> {
+  bool _h = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _h = true),
+      onExit: (_) => setState(() => _h = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          color: _h ? AppColors.surfaceHigh : Colors.transparent,
+          child: Row(
+            children: [
+              const Icon(Icons.search_rounded, color: AppColors.tertiary, size: 18),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Text(
+                  widget.suggestion,
+                  style: GoogleFonts.inter(
+                    color: AppColors.primary,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+              const Icon(Icons.arrow_outward_rounded, color: AppColors.tertiary, size: 14),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+

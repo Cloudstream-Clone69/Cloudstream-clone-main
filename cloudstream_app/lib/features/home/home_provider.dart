@@ -1,10 +1,10 @@
 // lib/features/home/home_provider.dart
-// Uses SIMKL API instead of TMDB — accessible on Jio without DNS workarounds.
 
 import 'package:flutter/foundation.dart';
-import '../../core/api/simkl_api.dart';
+import '../../core/api/tmdb_api.dart';
 import '../../core/models/tmdb_models.dart';
 import '../../core/services/local_db.dart';
+import '../../core/api/dns_over_https.dart';
 
 enum HomeStatus { idle, loading, loaded, error }
 
@@ -44,6 +44,9 @@ class HomeProvider extends ChangeNotifier {
 
     for (int attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
+        // Ensure DNS is pre-resolved using DoH in case it failed during boot
+        await DnsOverHttps.prefetch();
+
         // Load continue watching first (local, always fast)
         _continueWatching = await LocalDb.instance.getHistory();
         _continueWatching = _continueWatching
@@ -51,23 +54,27 @@ class HomeProvider extends ChangeNotifier {
             .take(20)
             .toList();
 
-        // Load all SIMKL sections in parallel
+        // Load all TMDB sections in parallel
         final results = await Future.wait([
-          SimklApi.instance.getTrendingMovies(),   // [0]
-          SimklApi.instance.getTrendingTv(),        // [1]
-          SimklApi.instance.getTrendingAnime(),     // [2]
-          SimklApi.instance.getPopularAnime(),      // [3] alias → trending anime
-          SimklApi.instance.getTopRatedMovies(),    // [4] alias → trending movies
-          SimklApi.instance.getTopRatedTv(),        // [5] alias → trending tv
+          TmdbApi.instance.getTrendingMovies(),   // [0]
+          TmdbApi.instance.getTrendingTv(),        // [1]
+          TmdbApi.instance.getPopularAnime(),      // [2]
+          TmdbApi.instance.getTopRatedAnime(),     // [3]
+          TmdbApi.instance.getTopRatedMovies(),    // [4]
+          TmdbApi.instance.getTopRatedTv(),        // [5]
+          TmdbApi.instance.getNowPlayingMovies(),  // [6]
+          TmdbApi.instance.getActionMovies(),      // [7]
         ]);
 
         _sections = [
           if (results[0].isNotEmpty) HomeSection('🔥 Trending Movies',    '🔥', results[0]),
           if (results[1].isNotEmpty) HomeSection('📺 Trending TV Shows',  '📺', results[1]),
           if (results[2].isNotEmpty) HomeSection('🎌 Popular Anime',      '🎌', results[2]),
-          if (results[3].isNotEmpty) HomeSection('⭐ Top Anime',          '⭐', results[3]),
+          if (results[3].isNotEmpty) HomeSection('⭐ Top Rated Anime',    '⭐', results[3]),
           if (results[4].isNotEmpty) HomeSection('🏆 Top Rated Movies',   '🏆', results[4]),
           if (results[5].isNotEmpty) HomeSection('🌟 Top Rated TV Shows', '🌟', results[5]),
+          if (results[6].isNotEmpty) HomeSection('🎬 Now Playing',        '🎬', results[6]),
+          if (results[7].isNotEmpty) HomeSection('💥 Action Movies',      '💥', results[7]),
         ];
 
         _status = HomeStatus.loaded;

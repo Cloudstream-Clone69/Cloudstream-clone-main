@@ -33,7 +33,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void _openDetail(BuildContext ctx, TmdbItem item) {
     ctx.push('/detail', extra: {
       'id': item.id,
-      'simklId': item.simklId,
       'mediaType': item.mediaType,
       'title': item.title,
       'poster': item.posterUrl,
@@ -117,16 +116,27 @@ class _HomeScreenState extends State<HomeScreen> {
   // ── Error ──────────────────────────────────────────────────────────────────
 
   Widget _buildError(BuildContext ctx, HomeProvider p) {
+    final isBackendDown = p.error == 'backend_unreachable';
     return Center(
       child: Column(mainAxisSize: MainAxisSize.min, children: [
-        const Icon(Icons.wifi_off_rounded, color: AppColors.tertiary, size: 52),
+        Icon(
+          isBackendDown ? Icons.power_off_rounded : Icons.cloud_off_rounded,
+          color: AppColors.tertiary,
+          size: 52,
+        ),
         const SizedBox(height: 16),
-        Text('Backend server not running',
-          style: GoogleFonts.inter(color: AppColors.primary, fontSize: 18, fontWeight: FontWeight.w700)),
+        Text(
+          isBackendDown ? 'Backend server not running' : 'Content failed to load',
+          style: GoogleFonts.inter(color: AppColors.primary, fontSize: 18, fontWeight: FontWeight.w700),
+        ),
         const SizedBox(height: 8),
-        Text('Start the backend, or go to Settings → DNS & Network\nto change your DNS if streams are blocked.',
+        Text(
+          isBackendDown
+              ? 'Make sure start.bat is running.\nGo to Settings → DNS & Network if streams are blocked.'
+              : 'Check your internet connection and try again.',
           textAlign: TextAlign.center,
-          style: GoogleFonts.inter(color: AppColors.tertiary, fontSize: 13)),
+          style: GoogleFonts.inter(color: AppColors.tertiary, fontSize: 13),
+        ),
         const SizedBox(height: 24),
         GestureDetector(
           onTap: p.refresh,
@@ -174,6 +184,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 'episodeNumber': h.episodeNumber ?? '',
                 'episodeTitle': h.episodeTitle ?? '',
               }),
+              onClearAll: () async {
+                await LocalDb.instance.clearHistory();
+                await p.refreshContinueWatching();
+              },
             ),
           ),
           const SliverToBoxAdapter(child: SizedBox(height: 24)),
@@ -525,7 +539,12 @@ class _ContentCardState extends State<_ContentCard> {
 class _ContinueWatchingRow extends StatelessWidget {
   final List<WatchHistory> items;
   final void Function(WatchHistory) onTap;
-  const _ContinueWatchingRow({required this.items, required this.onTap});
+  final VoidCallback onClearAll;
+  const _ContinueWatchingRow({
+    required this.items,
+    required this.onTap,
+    required this.onClearAll,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -534,10 +553,106 @@ class _ContinueWatchingRow extends StatelessWidget {
       child: ListView.builder(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 20),
-        itemCount: items.length,
-        itemBuilder: (ctx, i) => Padding(
-          padding: const EdgeInsets.only(right: 12),
-          child: _ContinueCard(item: items[i], onTap: () => onTap(items[i])),
+        itemCount: items.length + 1,
+        itemBuilder: (ctx, i) {
+          if (i == items.length) {
+            return Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: _ClearContinueCard(onTap: onClearAll),
+            );
+          }
+          return Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: _ContinueCard(item: items[i], onTap: () => onTap(items[i])),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ClearContinueCard extends StatefulWidget {
+  final VoidCallback onTap;
+  const _ClearContinueCard({required this.onTap});
+
+  @override
+  State<_ClearContinueCard> createState() => _ClearContinueCardState();
+}
+
+class _ClearContinueCardState extends State<_ClearContinueCard> {
+  bool _h = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _h = true),
+      onExit:  (_) => setState(() => _h = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: () {
+          showDialog(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              backgroundColor: AppColors.surface,
+              title: Text('Clear Continue Watching',
+                  style: GoogleFonts.inter(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+              content: Text('Are you sure you want to clear your continue watching history?',
+                  style: GoogleFonts.inter(color: Colors.white70, fontSize: 13)),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: Text('Cancel', style: GoogleFonts.inter(color: Colors.white60, fontSize: 12)),
+                ),
+                TextButton(
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    widget.onTap();
+                  },
+                  child: Text('Clear All', style: GoogleFonts.inter(color: AppColors.accent, fontWeight: FontWeight.bold, fontSize: 12)),
+                ),
+              ],
+            ),
+          );
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          width: 140,
+          decoration: BoxDecoration(
+            color: _h ? AppColors.accent.withValues(alpha: 0.15) : AppColors.surfaceHigh.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: _h ? AppColors.accent.withValues(alpha: 0.5) : AppColors.tertiary.withValues(alpha: 0.15),
+              width: 1.5,
+            ),
+          ),
+          transform: _h ? (Matrix4.identity()..scale(1.03)) : Matrix4.identity(),
+          transformAlignment: Alignment.center,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: _h ? AppColors.accent : AppColors.surfaceHigh,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.delete_sweep_rounded,
+                  color: _h ? Colors.white : AppColors.tertiary,
+                  size: 24,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Clear List',
+                style: GoogleFonts.inter(
+                  color: _h ? Colors.white : AppColors.secondary,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );

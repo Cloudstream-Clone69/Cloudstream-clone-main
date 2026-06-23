@@ -7,9 +7,11 @@ import 'package:go_router/go_router.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:window_manager/window_manager.dart';
 
+import 'dart:ui';
 import 'shared/theme/app_theme.dart';
 import 'shared/widgets/sidebar.dart';
 
+import 'features/splash/splash_screen.dart';
 import 'features/home/home_screen.dart';
 import 'features/home/home_provider.dart';
 import 'features/search/search_screen.dart';
@@ -18,7 +20,12 @@ import 'features/detail/detail_screen.dart';
 import 'features/player/player_screen.dart';
 import 'features/library/library_screen.dart';
 import 'features/settings/settings_screen.dart';
+import 'features/splash/maintenance_screen.dart';
+import 'features/splash/update_screen.dart';
+import 'core/services/update_service.dart';
 import 'core/services/app_settings.dart';
+import 'core/services/download_service.dart';
+import 'core/api/dns_over_https.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -28,6 +35,10 @@ void main() async {
   MediaKit.ensureInitialized();
   // Init app settings (loads prefs + applies DNS to backend)
   await AppSettings.instance.init();
+  // Init download manager (loads active tasks and resumes speed calculations)
+  await DownloadService.instance.init();
+  // Pre-resolve TMDB hostnames via Cloudflare DoH (bypasses Jio DNS block)
+  await DnsOverHttps.prefetch();
   runApp(
     MultiProvider(
       providers: [
@@ -51,8 +62,40 @@ class _TrustAllCerts extends HttpOverrides {
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 final _router = GoRouter(
-  initialLocation: '/',
+  initialLocation: '/splash',
   routes: [
+    // Splash / welcome screen (entry point)
+    GoRoute(
+      path: '/splash',
+      pageBuilder: (ctx, state) => NoTransitionPage<void>(
+        key: state.pageKey,
+        child: const SplashScreen(),
+      ),
+    ),
+    GoRoute(
+      path: '/maintenance',
+      pageBuilder: (ctx, state) {
+        final message = state.extra as String? ?? 'System maintenance in progress.';
+        return NoTransitionPage<void>(
+          key: state.pageKey,
+          child: MaintenanceScreen(message: message),
+        );
+      },
+    ),
+    GoRoute(
+      path: '/update',
+      pageBuilder: (ctx, state) {
+        final extra = state.extra as Map<String, dynamic>?;
+        return _slideUpPage(
+          state,
+          UpdateScreen(
+            info: extra?['info'] as UpdateInfo,
+            isMandatory: extra?['mandatory'] as bool? ?? false,
+          ),
+        );
+      },
+    ),
+
     // Shell route — wraps sidebar around Home / Search / Library / Settings / Detail
     ShellRoute(
       builder: (ctx, state, child) => AppSidebar(child: child),
@@ -67,15 +110,18 @@ final _router = GoRouter(
         ),
         GoRoute(
           path: '/library',
-          pageBuilder: (ctx, state) => _noTransitionPage(state, const LibraryScreen()),
+          pageBuilder: (ctx, state) => _noTransitionPage(state, const LibraryScreen(initialTabIndex: 0)),
         ),
         GoRoute(
           path: '/downloads',
-          pageBuilder: (ctx, state) => _noTransitionPage(state, const LibraryScreen()),
+          pageBuilder: (ctx, state) => _noTransitionPage(state, const LibraryScreen(initialTabIndex: 2)),
         ),
         GoRoute(
           path: '/settings',
-          pageBuilder: (ctx, state) => _noTransitionPage(state, const SettingsScreen()),
+          pageBuilder: (ctx, state) {
+            final tab = state.uri.queryParameters['tab'];
+            return _noTransitionPage(state, SettingsScreen(initialTab: tab));
+          },
         ),
         GoRoute(
           path: '/detail',
@@ -84,14 +130,15 @@ final _router = GoRouter(
             return _slideUpPage(
               state,
               DetailScreen(
-                id:          extra['id']          as int,
-                simklId:     extra['simklId']     as int? ?? 0,
-                mediaType:   extra['mediaType']   as String,
+                id:          extra['id']          as int?,
+                mediaType:   extra['mediaType']   as String?,
                 title:       extra['title']       as String? ?? '',
                 posterUrl:   extra['poster']      as String? ?? '',
                 backdropUrl: extra['backdrop']    as String? ?? '',
                 overview:    extra['overview']    as String? ?? '',
                 releaseDate: extra['releaseDate'] as String? ?? '',
+                provider:    extra['provider']    as String?,
+                providerUrl: extra['providerUrl'] as String?,
               ),
             );
           },
@@ -108,7 +155,6 @@ final _router = GoRouter(
           state,
           PlayerScreen(
             tmdbId:        extra['tmdbId']        as String? ?? '',
-            simklId:       extra['simklId']       as int?    ?? 0,
             mediaType:     extra['mediaType']     as String? ?? '',
             title:         extra['title']         as String? ?? '',
             year:          extra['year']          as String? ?? '',
@@ -120,6 +166,8 @@ final _router = GoRouter(
             preloadedProvider: extra['preloadedProvider'] as String?,
             backdropUrl:   extra['backdrop']      as String?,
             logoUrl:       extra['logo']          as String?,
+            episodeUrl:    extra['episodeUrl']    as String?,
+            showUrl:       extra['showUrl']       as String?,
           ),
         );
       },
@@ -153,6 +201,16 @@ Page<void> _slideUpPage(GoRouterState state, Widget child) {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+class AppScrollBehavior extends MaterialScrollBehavior {
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+        PointerDeviceKind.stylus,
+      };
+}
+
 class CloudStreamApp extends StatelessWidget {
   const CloudStreamApp({super.key});
 
@@ -163,6 +221,7 @@ class CloudStreamApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark,
       routerConfig: _router,
+      scrollBehavior: AppScrollBehavior(),
     );
   }
 }

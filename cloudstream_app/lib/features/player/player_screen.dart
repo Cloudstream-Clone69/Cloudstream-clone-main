@@ -2,6 +2,7 @@
 // Full player: lazy episode refs, on-demand fresh URL resolution, quality+subtitle panel
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -15,17 +16,19 @@ import 'package:window_manager/window_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/api/stream_resolver.dart';
-import '../../core/api/simkl_api.dart';
+import '../../core/api/tmdb_api.dart';
 import '../../core/models/tmdb_models.dart';
 import '../../core/services/local_db.dart';
+import '../../core/services/app_settings.dart';
 import '../../shared/theme/app_theme.dart';
+import '../../core/services/cast_service.dart';
+
 
 enum _LoadState { fetching, playing, error }
-enum _PanelTab { none, sources, episodes, quality, audio, subtitles }
+enum _PanelTab { none, sources, episodes, quality, audio, subtitles, chapters }
 
 class PlayerScreen extends StatefulWidget {
   final String tmdbId;
-  final int simklId;  // SIMKL ID for episode metadata (0 if not known)
   final String mediaType;
   final String title;
   final String year;
@@ -37,11 +40,12 @@ class PlayerScreen extends StatefulWidget {
   final String? preloadedProvider;
   final String? backdropUrl;
   final String? logoUrl;
+  final String? episodeUrl;
+  final String? showUrl;
 
   const PlayerScreen({
     super.key,
     required this.tmdbId,
-    this.simklId = 0,
     required this.mediaType,
     required this.title,
     required this.year,
@@ -53,6 +57,8 @@ class PlayerScreen extends StatefulWidget {
     this.preloadedProvider,
     this.backdropUrl,
     this.logoUrl,
+    this.episodeUrl,
+    this.showUrl,
   });
 
   @override
@@ -60,12 +66,17 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
-  late final Player _player;
-  late final VideoController _videoCtrl;
+  // Player fields are NOT final — we recreate them on every source switch
+  // to get a fully clean libmpv instance (stop()+open() on the same player
+  // crashes on Windows because the DASH demuxer thread keeps running).
+  late Player _player;
+  late VideoController _videoCtrl;
+  int _playerGeneration = 0; // incremented each rebuild so Video widget remounts
 
   _LoadState _loadState = _LoadState.fetching;
   String? _error;
   String _loadStep = 'Getting things ready…'; // user-friendly loading step message
+  Timer? _watchdogTimer; // fires if playback never starts (e.g. DASH cookie failure)
   String? _backdropUrl;
   String? _logoUrl;
 
@@ -94,6 +105,13 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   bool _showControls = false;
   Timer? _hideTimer;
 
+  // AniSkip & Chapters
+  List<SkipInterval> _skipIntervals = [];
+  List<MediaChapter> _chapters = [];
+  int? _malId;
+  int? _anilistId;
+  bool _skipTimesLoaded = false;
+
   // Next episode overlay (shown in last 90s, auto-plays with countdown)
   bool _showNextEp = false;
   int _nextEpCountdown = 5;   // seconds until auto-play
@@ -113,12 +131,24 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   // Aspect ratio: 'fit' | 'crop' | 'stretch'
   String _aspectRatio = 'fit';
 
+  // Casting state
+  CastDevice? _activeCastDevice;
+
   // Fullscreen
   bool _isFullscreen = false;
 
   // Seek flash animation: -1 = backward, 0 = none, +1 = forward
   int _seekFlash = 0;
   Timer? _seekFlashTimer;
+  Duration? _targetSeekPosition;
+  Timer? _seekDebounceTimer;
+
+  // Flag to prevent concurrent episode switches
+  bool _isSwitching = false;
+
+  // Guard flag: true while _openSource is running (between stop() and open() completing).
+  // Any setProperty call or seek during this window will crash libmpv on Windows.
+  bool _isPlayerBusy = false;
 
   // Next-episode background preload
   StreamSource? _preloadedNextSrc;
@@ -126,6 +156,9 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
   // Setting: pause when app loses focus
   bool _pauseOnFocusLoss = true;
+  String _subSize = '55';
+  String _subColor = '#FFFFFFFF';
+  String _subBgColor = '#80000000';
 
   Timer? _bufferPollTimer;
 
@@ -135,20 +168,52 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   @override
   void initState() {
     super.initState();
-    _player = Player(configuration: const PlayerConfiguration(logLevel: MPVLogLevel.error));
+    _player = Player(configuration: const PlayerConfiguration(logLevel: MPVLogLevel.warn));
     _videoCtrl = VideoController(_player);
+    _attachPlayerListeners();
 
     // Configure MPV for YouTube-like pre-buffering to avoid interruptions
     // Especially important on Cloudflare/slow DNS setups
     _configureBuffer();
 
+    _selectedSeasonNumber = int.tryParse(widget.seasonNumber) ?? 1;
+    _backdropUrl = widget.backdropUrl;
+    _logoUrl = widget.logoUrl;
+    if ((_backdropUrl == null || _backdropUrl!.isEmpty) || (_logoUrl == null || _logoUrl!.isEmpty)) {
+      _fetchMediaDetailsIfNeeded();
+    }
+    _resolveAndPlay();
+    _scheduleHide();
+    _loadSettings();
+    _loadAllSeasons();
+    if (widget.mediaType == 'tv') {
+      Future.microtask(() => _loadTmdbEpisodes());
+    }
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  /// Attach all stream listeners to the current _player instance.
+  /// Called once at init and again after every player rebuild.
+  void _attachPlayerListeners() {
     _subs.addAll([
       _player.stream.position.listen((p) {
-        if (_isDragging || !mounted) return;
+        if (_isDragging || _targetSeekPosition != null || !mounted) return;
         setState(() => _position = p);
         _checkSkipOverlays(p);
       }),
-      _player.stream.duration.listen((d) { if (mounted) setState(() => _duration = d); }),
+      _player.stream.duration.listen((d) {
+        if (mounted) {
+          setState(() => _duration = d);
+          if (d.inSeconds > 0) {
+            if (!_skipTimesLoaded) {
+              _fetchSkipTimes();
+            }
+            if (_chapters.isEmpty) {
+              _fetchChapters();
+            }
+          }
+        }
+      }),
       _player.stream.playing.listen((p) { if (mounted) setState(() => _isPlaying = p); }),
       _player.stream.buffering.listen((b) {
         if (mounted) {
@@ -171,31 +236,82 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         });
       }),
       _player.stream.error.listen((e) {
-        if (e.isNotEmpty && mounted) _onPlaybackError(e);
+        // Ignore errors fired during teardown (generation mismatch)
+        if (e.isNotEmpty && mounted && !_isSwitching) _onPlaybackError(e);
       }),
       // Auto-play next episode when current finishes
       _player.stream.completed.listen((done) {
-        if (done && mounted && widget.mediaType == 'tv') {
+        if (done && mounted && widget.mediaType == 'tv' && !_isSwitching) {
           Future.delayed(const Duration(milliseconds: 500), _goNextEpisode);
         }
       }),
     ]);
+  }
 
-    _selectedSeasonNumber = int.tryParse(widget.seasonNumber) ?? 1;
-    _backdropUrl = widget.backdropUrl;
-    _logoUrl = widget.logoUrl;
-    if ((_backdropUrl == null || _backdropUrl!.isEmpty) || (_logoUrl == null || _logoUrl!.isEmpty)) {
-      _fetchMediaDetailsIfNeeded();
-    }
-    _resolveAndPlay();
-    _scheduleHide();
-    _loadSettings();
-    _loadAllSeasons(); // Load seasons list for Episodes panel dropdown
-    // Proactively load episodes so the panel is ready when opened
-    if (widget.mediaType == 'tv') {
-      Future.microtask(() => _loadTmdbEpisodes());
-    }
-    WidgetsBinding.instance.addObserver(this);
+  /// Fully rebuilds the Player and VideoController to get a completely clean
+  /// libmpv instance before opening a new source.
+  ///
+  /// WHY WE RECREATE instead of reusing the same player:
+  ///   Calling open() on an existing Player that was playing a DASH stream
+  ///   causes libmpv's internal demuxer thread to run teardown while the
+  ///   C++ network read loop is still active on Windows → ntdll.dll 0xC0000005.
+  ///
+  Future<void> _safeSwitchPlayer() async {
+    // Cancel all timers that interact with the player
+    _watchdogTimer?.cancel();
+    _bufferPollTimer?.cancel();
+    _nextEpTimer?.cancel();
+    _seekDebounceTimer?.cancel();
+    _progressTimer?.cancel();
+
+    // Detach Dart listeners before touching native player
+    for (final s in _subs) { try { s.cancel(); } catch (_) {} }
+    _subs.clear();
+
+    // ── Step 1: Kill all proxy segment downloads ──────────────────────────────
+    // This stops data arriving at libmpv's ring-buffer before we do anything else.
+    try {
+      await Dio().get('${AppSettings.instance.backendUrl}/proxy/abort-all')
+          .timeout(const Duration(milliseconds: 600));
+    } catch (_) {}
+
+    // ── Step 2: Tell MPV to stop its demuxer read-ahead ───────────────────────
+    // These are synchronous native calls — just fire them.
+    try {
+      final native = _player.platform as dynamic;
+      native.setProperty('demuxer-max-bytes', '1');
+      native.setProperty('cache', 'no');
+    } catch (_) {}
+
+    // ── Step 3: Pause the player ──────────────────────────────────────────────
+    try { await _player.pause(); } catch (_) {}
+
+    // ── Step 4: Wait for everything to settle ─────────────────────────────────
+    // 500ms gives the demuxer write queue and any in-flight native callbacks
+    // time to drain before we call open() on the same player.
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    // ── Step 5: Reset playback UI state ──────────────────────────────────────
+    if (mounted) setState(() {
+      _isPlayerBusy = false;
+      _isBuffering  = false;
+      _position     = Duration.zero;
+      _duration     = Duration.zero;
+      _buffered     = Duration.zero;
+      _hlsVariants  = [];
+      _activeVariantBandwidth = -1;
+      _tracks       = const Tracks();
+      _activeVideo  = VideoTrack.auto();
+      _activeAudio  = AudioTrack.auto();
+      _activeSubtitle = SubtitleTrack.no();
+    });
+
+    // ── Step 6: Reattach listeners to the same player ────────────────────────
+    // We deliberately do NOT recreate the Player instance. MPV's own
+    // player.open(newMedia) sends 'loadfile … replace' to the internal
+    // playloop thread, which tears down the old demuxer from the SAME thread
+    // that owns it — making the transition atomic and crash-free on Windows.
+    _attachPlayerListeners();
   }
 
   @override
@@ -213,6 +329,10 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _nextEpTimer?.cancel();
     _bufferPollTimer?.cancel();
     _seekFlashTimer?.cancel();
+    _seekDebounceTimer?.cancel();
+    _watchdogTimer?.cancel();
+    _hideTimer?.cancel();
+    _progressTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     if (_isFullscreen) {
       try {
@@ -220,13 +340,18 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
       } catch (_) {}
     }
-    // Pause first to let MPV flush any pending HLS segment reads
+    // Cancel all Dart stream subscriptions before touching native player
+    for (final s in _subs) { try { s.cancel(); } catch (_) {} }
+    // ── DASH demuxer drain (synchronous best-effort) ─────────────────────
+    // Note: _goNextEpisode already aborts + drains + pauses before navigation,
+    // so in most cases the player is already quiet here.
+    // For unexpected dispose (e.g. back button), do a best-effort drain.
+    try {
+      final native = _player.platform as dynamic;
+      native.setProperty('cache', 'no');
+      native.setProperty('demuxer-max-bytes', '1');
+    } catch (_) {}
     try { _player.pause(); } catch (_) {}
-    _hideTimer?.cancel();
-    _progressTimer?.cancel();
-    // Cancel all Dart stream subscriptions before disposing native player
-    for (final s in _subs) s.cancel();
-    // dispose() internally calls stop+cleanup — don't call stop() separately
     _player.dispose();
     super.dispose();
   }
@@ -239,11 +364,132 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _error = null;
       _episodeRefs = [];
       _currentSource = null;
-      _loadStep = 'Looking up "${widget.title}"…';
+      _loadStep = 'Loading available sources…';
     });
 
     try {
-      // Step 0: Check if we have a preloaded source
+      // Step 1: Fetch all episode references first (so the sources list is loaded FIRST!)
+      final providerFilter = (widget.preloadedProvider != null && widget.preloadedProvider!.isNotEmpty)
+          ? widget.preloadedProvider
+          : null;
+
+      final refs = await StreamResolver.instance.getEpisodeRefs(
+        title: widget.title,
+        mediaType: widget.mediaType,
+        year: widget.year,
+        seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
+        episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
+        isAnime: widget.isAnime,
+        provider: providerFilter,
+        showUrl: widget.showUrl,
+      );
+
+      if (refs.isNotEmpty) {
+        if (mounted) setState(() {
+          _episodeRefs = refs;
+        });
+
+        // Resolve preferred language/quality
+        final prefs = await SharedPreferences.getInstance();
+        final prefLang = prefs.getString('preferred_anidb_lang') ?? 'Sub';
+
+        // Select the best match from refs
+        EpisodeRef bestRef = refs.first;
+        for (final r in refs) {
+          if (r.quality.toLowerCase() == prefLang.toLowerCase()) {
+            bestRef = r;
+            break;
+          }
+        }
+
+        final idx = refs.indexOf(bestRef);
+        if (mounted && idx >= 0) {
+          setState(() {
+            _activeRefIdx = idx;
+          });
+        }
+
+        // If we have a preloaded URL, use it directly instead of resolving again
+        if (widget.preloadedUrl != null && widget.preloadedUrl!.isNotEmpty) {
+          final isDub = widget.preloadedUrl!.contains('lang=eng') || 
+                        widget.preloadedUrl!.contains('quality=Dub');
+          final preloadedSrc = StreamSource(
+            provider: widget.preloadedProvider ?? 'anidb',
+            label: widget.preloadedProvider == 'anidb'
+                ? (isDub ? 'AniDB [Dub]' : 'AniDB [Sub]')
+                : 'Preloaded Source',
+            quality: isDub ? 'Dub' : 'Sub',
+            size: '',
+            url: widget.preloadedUrl!,
+            fallbackUrl: '',
+            referer: 'https://anidb.app/',
+            subtitleUrl: '',
+            episodeUrl: '',
+          );
+
+          if (mounted) setState(() {
+            _currentSource = preloadedSrc;
+            _loadState = _LoadState.playing;
+            _showControls = false;
+            _watchdogTimer?.cancel();
+          });
+
+          await _openSource(preloadedSrc);
+          _saveHistory();
+          return;
+        }
+
+        if (mounted) setState(() {
+          _loadStep = 'Resolving stream: ${bestRef.label}…';
+        });
+
+        final src = await StreamResolver.instance.resolveStreamForEpisode(
+          provider: bestRef.provider,
+          episodeUrl: bestRef.episodeUrl,
+          quality: bestRef.quality,
+          size: bestRef.size,
+          label: bestRef.label,
+        );
+
+        if (src == null) {
+          throw Exception('Could not resolve stream for "${widget.title}".');
+        }
+
+        if (mounted) setState(() {
+          _currentSource = src;
+          _loadState = _LoadState.playing;
+          _showControls = false;
+          _watchdogTimer?.cancel();
+        });
+
+        await _openSource(src);
+        _saveHistory();
+        return;
+      }
+
+      // Step 2: Fallback to direct resolution of episodeUrl if refs is empty (e.g. scraper detail mapped watch URL)
+      if (widget.episodeUrl != null && widget.episodeUrl!.isNotEmpty) {
+        if (mounted) setState(() {
+          _loadStep = 'Resolving stream from ${widget.preloadedProvider ?? "provider"}…';
+        });
+        final src = await StreamResolver.instance.resolveStreamForEpisode(
+          provider: widget.preloadedProvider ?? '',
+          episodeUrl: widget.episodeUrl!,
+          quality: '1080p',
+          size: '',
+          label: '${widget.title} - ${widget.episodeTitle}',
+        );
+        if (src == null) {
+          throw Exception('Could not resolve stream for "${widget.title}".');
+        }
+        _setCurrentSource(src);
+        _fetchEpisodeRefsInBackground();
+        await _openSource(src);
+        _saveHistory();
+        return;
+      }
+
+      // Step 3: Fallback to preloadedUrl
       if (widget.preloadedUrl != null && widget.preloadedUrl!.isNotEmpty) {
         final isDub = widget.preloadedUrl!.contains('lang=eng') || 
                       widget.preloadedUrl!.contains('quality=Dub');
@@ -258,52 +504,28 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           fallbackUrl: '',
           referer: 'https://anidb.app/',
           subtitleUrl: '',
-          episodeUrl: '', // Will populate from getEpisodeRefs below
+          episodeUrl: '',
         );
 
-        if (mounted) setState(() {
-          _currentSource = preloadedSrc;
-          _loadState = _LoadState.playing;
-        });
-
+        _setCurrentSource(preloadedSrc);
+        _fetchEpisodeRefsInBackground();
         await _openSource(preloadedSrc);
         _saveHistory();
-
-        // Load sources panel in background (non-blocking)
-        StreamResolver.instance.getEpisodeRefs(
-          title: widget.title, mediaType: widget.mediaType, year: widget.year,
-          seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
-          episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
-          isAnime: widget.isAnime,
-        ).then((refs) {
-          if (!mounted) return;
-          setState(() {
-            _episodeRefs = refs;
-            final idx = refs.indexWhere((r) =>
-                r.provider == preloadedSrc.provider &&
-                (r.episodeUrl == preloadedSrc.url || 
-                 preloadedSrc.url.contains(r.episodeUrl.split('?').first)));
-            if (idx >= 0) _activeRefIdx = idx;
-          });
-        }).catchError((_) {});
-
         return;
       }
 
-      // Step 1: Load preferred language and resolve first playable source
-      final prefs = await SharedPreferences.getInstance();
-      final prefLang = prefs.getString('preferred_anidb_lang') ?? 'Sub';
-
-      // resolveFirstSource races providers in the correct order based on isAnime
+      // Step 4: Fallback to resolveFirstSource
+      if (mounted) setState(() {
+        _loadStep = 'Searching for first working source…';
+      });
       final first = await StreamResolver.instance.resolveFirstSource(
         title: widget.title, mediaType: widget.mediaType, year: widget.year,
         seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
         episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
-        preferredQuality: prefLang,
         isAnime: widget.isAnime,
+        provider: providerFilter,
       );
 
-      // Step 2: Check we got something
       if (first == null) {
         final backendUp = await StreamResolver.instance.ping();
         if (!backendUp) {
@@ -313,37 +535,107 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         }
       }
 
-      // Step 3: Go to playing state IMMEDIATELY — don't wait for Sources panel
-      if (mounted) setState(() {
-        _currentSource = first;
-        _loadState = _LoadState.playing;
-      });
-
-      // Step 4: Open video NOW
+      _setCurrentSource(first);
+      _fetchEpisodeRefsInBackground();
       await _openSource(first);
       _saveHistory();
-
-      // Step 5: Load sources panel in background (non-blocking)
-      // User is already watching — this just populates the Sources/Quality panels
-      StreamResolver.instance.getEpisodeRefs(
-        title: widget.title, mediaType: widget.mediaType, year: widget.year,
-        seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
-        episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
-        isAnime: widget.isAnime,
-      ).then((refs) {
-        if (!mounted) return;
-        setState(() {
-          _episodeRefs = refs;
-          final idx = refs.indexWhere((r) =>
-              r.provider == first.provider && r.episodeUrl == first.episodeUrl);
-          if (idx >= 0) _activeRefIdx = idx;
-        });
-      }).catchError((_) {});
 
     } catch (e) {
       if (mounted) setState(() { _error = e.toString(); _loadState = _LoadState.error; });
     }
   }
+
+  void _setCurrentSource(StreamSource src) {
+    if (mounted) {
+      setState(() {
+        _currentSource = src;
+        _loadState = _LoadState.playing;
+        _showControls = false;
+        _watchdogTimer?.cancel();
+        if (_episodeRefs.isEmpty) {
+          _episodeRefs = [
+            EpisodeRef(
+              provider: src.provider,
+              quality: src.quality,
+              size: src.size,
+              title: src.label,
+              episodeUrl: src.episodeUrl.isNotEmpty ? src.episodeUrl : widget.episodeUrl ?? '',
+            )
+          ];
+          _activeRefIdx = 0;
+        }
+      });
+    }
+  }
+
+  void _fetchEpisodeRefsInBackground() async {
+    try {
+      final settings = AppSettings.instance;
+      final List<String> rawOrder = widget.isAnime
+          ? settings.animeProviderOrder
+          : (widget.mediaType == 'movie'
+              ? settings.movieProviderOrder
+              : settings.seriesProviderOrder);
+
+      final List<String> providers;
+      if (widget.preloadedProvider != null && widget.preloadedProvider!.isNotEmpty) {
+        providers = [widget.preloadedProvider!];
+      } else {
+        providers = rawOrder.where((p) => StreamResolver.instance.isProviderEnabled(p)).toList();
+      }
+      if (providers.isEmpty) return;
+
+      print('[Player] Progressive fetch started for: $providers');
+
+      for (final p in providers) {
+        StreamResolver.instance.getEpisodeRefs(
+          title: widget.title,
+          mediaType: widget.mediaType,
+          year: widget.year,
+          seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
+          episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
+          isAnime: widget.isAnime,
+          provider: p,
+          showUrl: widget.showUrl,
+        ).then((newRefs) {
+          if (!mounted) return;
+          if (newRefs.isNotEmpty) {
+            setState(() {
+              final existingUrls = _episodeRefs.map((r) => r.episodeUrl).toSet();
+              final uniqueNew = newRefs.where((r) => !existingUrls.contains(r.episodeUrl)).toList();
+              
+              if (uniqueNew.isNotEmpty) {
+                if (_episodeRefs.length == 1 && (_episodeRefs[0].episodeUrl == widget.episodeUrl || _episodeRefs[0].episodeUrl == _currentSource?.episodeUrl)) {
+                  final hasMatch = uniqueNew.any((r) => r.episodeUrl == _episodeRefs[0].episodeUrl);
+                  if (hasMatch) {
+                    _episodeRefs = uniqueNew;
+                  } else {
+                    _episodeRefs = [..._episodeRefs, ...uniqueNew];
+                  }
+                } else {
+                  _episodeRefs = [..._episodeRefs, ...uniqueNew];
+                }
+                
+                if (_currentSource != null) {
+                  final activeUrl = _currentSource!.episodeUrl;
+                  final idx = _episodeRefs.indexWhere((r) => r.episodeUrl == activeUrl || r.episodeUrl == widget.episodeUrl);
+                  if (idx >= 0) {
+                    _activeRefIdx = idx;
+                  }
+                }
+                print('[Player] Added ${uniqueNew.length} refs from $p. Total: ${_episodeRefs.length}');
+              }
+            });
+          }
+        }).catchError((err) {
+          print('[Player] Progressive fetch error for $p: $err');
+        });
+      }
+    } catch (e) {
+      print('[Player] Progressive fetch master error: $e');
+    }
+  }
+
 
   // ── Buffering ──────────────────────────────────────────────────────────────────────
 
@@ -352,31 +644,52 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     try {
       final native = _player.platform as dynamic;
       await native.setProperty('cache', 'yes');
-      // Buffer 60s ahead while watching — seeking within this range is instant
-      await native.setProperty('cache-secs', '60');
-      await native.setProperty('demuxer-readahead-secs', '5'); // start after 5s buffer
-      // Large forward + backward cache so ±10s seeks never need a download
+      // Buffer 120s ahead for smooth network playback
+      await native.setProperty('cache-secs', '120');
+      await native.setProperty('demuxer-readahead-secs', '120');
+      
+      // 150MB max buffer to store high-bitrate video segments in memory
       await native.setProperty('demuxer-max-bytes', '150MiB');
-      await native.setProperty('demuxer-max-back-bytes', '100MiB'); // backward seek cache
+      await native.setProperty('demuxer-max-back-bytes', '50MiB'); // back buffer for smooth rewinding
+      
+      // Stop buffering once the limit is reached and resume when 10s remain
+      await native.setProperty('demuxer-hysteresis-secs', '10');
+      
       // Keyframe seeking — MUCH faster than hr-seek for HLS (no frame decode overhead)
       await native.setProperty('hr-seek', 'no');
-      // Don't freeze playback during seek buffer fill
-      await native.setProperty('cache-pause', 'no');
-      // HLS: best quality + prefetch next playlist segment for smooth playback
+      // Pause playback during seek buffer fill to prevent desync
+      await native.setProperty('cache-pause', 'yes');
+      
       await native.setProperty('hls-bitrate', 'max');
-      await native.setProperty('prefetch-playlist', 'yes');
-      // Network: reconnect on drop
-      await native.setProperty('network-timeout', '20');
-      await native.setProperty(
-        'stream-lavf-o',
-        'reconnect=1,reconnect_at_eof=1,reconnect_streamed=1,reconnect_delay_max=5',
-      );
-      await native.setProperty('demuxer-thread', 'yes');
-      print('[Player] Buffer configured: 5s start, 60s ahead, 150MB fwd + 100MB back');
+      await native.setProperty('prefetch-playlist', 'no');
+      await native.setProperty('hwdec', 'auto-safe');
+      await _applySubtitleStyle();
+      print('[Player] Buffer configured: 120s readahead, 150MB max-bytes, hwdec=auto-safe');
     } catch (e) {
       print('[Player] Buffer config skipped: $e');
     }
   }
+
+  /// Awaitable version of _configureBuffer — used after _rebuildPlayer()
+  /// so buffer settings are applied before _openSource is called.
+  Future<void> _configureBufferAsync() async {
+    try {
+      final native = _player.platform as dynamic;
+      await native.setProperty('cache', 'yes');
+      await native.setProperty('cache-secs', '120');
+      await native.setProperty('demuxer-readahead-secs', '120');
+      await native.setProperty('demuxer-max-bytes', '150MiB');
+      await native.setProperty('demuxer-max-back-bytes', '50MiB');
+      await native.setProperty('demuxer-hysteresis-secs', '10');
+      await native.setProperty('hr-seek', 'no');
+      await native.setProperty('cache-pause', 'yes');
+      await native.setProperty('hls-bitrate', 'max');
+      await native.setProperty('prefetch-playlist', 'no');
+      await native.setProperty('hwdec', 'auto-safe');
+      await _applySubtitleStyle();
+    } catch (_) {}
+  }
+
 
   /// Start polling MPV for buffer position (for the YouTube-style buffer bar).
   void _startBufferPolling() {
@@ -399,15 +712,34 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
   // ── Open source ──────────────────────────────────────────────────────────────
 
-  Future<void> _openSource(StreamSource source) async {
+  Future<void> _openSource(StreamSource source, {Duration? startPosition}) async {
     print('[Player] Opening: ${source.url}');
+    setState(() {
+      _skipIntervals = [];
+      _chapters = [];
+      _skipTimesLoaded = false;
+    });
+
+    // For proxied DASH streams (/proxy/stream.mpd) the Node.js proxy injects
+    // CloudFront cookies server-side into every segment request via /proxy/cdn/:session.
+    // Passing the 650-char CloudFront cookie string into libmpv's native property
+    // system causes a memory access violation (0xc0000005 in ntdll.dll) on Windows.
+    // We therefore skip ALL http-header-fields and Media httpHeaders for proxied DASH.
+    final bool isProxiedDash = source.url.contains('/proxy/stream.mpd') || source.url.contains('/proxy/mpd');
+
+    // Mark player as busy — no seek calls should happen until open() finishes.
+    _isPlayerBusy = true;
 
     try {
       final native = _player.platform as dynamic;
 
-      // AniDB streams come from hls.anidb.app which is behind Cloudflare.
-      // Cloudflare on hls.anidb.app blocks browser UAs but allows Android Dalvik.
-      // We set this BEFORE open() so it applies to every HLS request (master, sub-playlist, segments).
+      // Apply all buffer + network settings FIRST, sequentially, before open().
+      // This MUST be awaited — calling open() while setProperty calls are still
+      // in progress on the same player instance causes a crash on Windows.
+      await _configureBufferAsync();
+
+      // AniDB streams require Android Dalvik UA to bypass Cloudflare CDN.
+      // All other providers use a standard browser UA.
       if (source.provider == 'anidb') {
         await native.setProperty('user-agent',
             'Dalvik/2.1.0 (Linux; U; Android 13; Pixel 7 Build/TQ3A.230805.001)');
@@ -416,30 +748,159 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
       }
 
-      // Set the Referer header for ALL HLS sub-requests (critical for vibeplayer.site).
-      // Without this, CDNs reject sub-playlist and segment requests with 403.
+      // Referer via MPV property (applies to all sub-requests)
       if (source.referer.isNotEmpty) {
         await native.setProperty('referrer', source.referer);
       }
-    } catch (_) {}
 
-    // Open direct stream URL — MPV handles HLS natively using the headers set above.
-    await _player.open(Media(source.url), play: true);
-    await _player.play();
+      if (!isProxiedDash) {
+        final headerParts = <String>[];
+        if (source.cookie.isNotEmpty) {
+          headerParts.add('Cookie: ${source.cookie}');
+        }
+        if (source.referer.isNotEmpty) {
+          headerParts.add('Referer: ${source.referer}');
+        }
+        if (headerParts.isNotEmpty) {
+          await native.setProperty('http-header-fields', headerParts.join(','));
+          print('[Player] Set http-header-fields: ${headerParts.map((h) => h.split(':').first).join(", ")}');
+        } else {
+          // Clear any previous headers from a different stream
+          await native.setProperty('http-header-fields', '');
+        }
+      } else {
+        // Explicitly clear headers so a previous stream's large cookie isn't reused
+        try { await native.setProperty('http-header-fields', ''); } catch (_) {}
+        print('[Player] Proxied DASH — skipping http-header-fields (proxy handles auth)');
+      }
+    } catch (e) {
+      print('[Player] MPV property error: $e');
+    }
 
-    // Reset quality variants + buffered position for this new source
-    if (mounted) setState(() { _hlsVariants = []; _activeVariantBandwidth = -1; _buffered = Duration.zero; });
+    // Guard: if the widget was unmounted or a new switch started during the
+    // async setProperty calls above, abort before calling open().
+    if (!mounted) { _isPlayerBusy = false; return; }
+
+    // Build per-media HTTP headers map (for HLS/MP4 direct streams).
+    // Skip for proxied DASH — the Node.js proxy handles all auth server-side
+    // and passing the large CloudFront cookie here crashes libmpv on Windows.
+    final Map<String, String> httpHeaders = {};
+    if (!isProxiedDash) {
+      if (source.referer.isNotEmpty) {
+        httpHeaders['Referer'] = source.referer;
+      }
+      if (source.cookie.isNotEmpty) {
+        httpHeaders['Cookie'] = source.cookie;
+      }
+    }
+
+    // Open the stream.
+    // NOTE: open() is fully async internally — it fetches the MPD/M3U8, initialises
+    // the demuxer, and THEN starts playback. DO NOT call play() immediately after
+    // open(play:true) — that races the demuxer init and causes a crash in libmpv.
+    final media = httpHeaders.isNotEmpty
+        ? Media(source.url, httpHeaders: httpHeaders)
+        : Media(source.url);
+
+    try {
+      await _player.open(media, play: true);
+      // open(play:true) already starts playback — no additional .play() call needed.
+    } catch (e) {
+      print('[Player] _player.open error: $e');
+      _isPlayerBusy = false;
+      rethrow;
+    }
+
+    // Player is now live — release the busy guard
+    _isPlayerBusy = false;
+
+    // Reset quality panel + buffer tracker, and transition to playing state
+    if (mounted) {
+      setState(() {
+        _hlsVariants = [];
+        _activeVariantBandwidth = -1;
+        _buffered = Duration.zero;
+        _loadState = _LoadState.playing;
+      });
+    }
     _fetchHlsVariants(source);
-    _startBufferPolling(); // YouTube-style: poll MPV for demuxer-cache-time
+    _startBufferPolling();
+
+    // ── Playback-start watchdog ───────────────────────────────────────────────
+    // If MPV opens the URL but never starts buffering, switch to fallback after 25s.
+    _schedulePlaybackWatchdog(source, timeout: const Duration(seconds: 25));
 
     // Load subtitle if available
+    // If no external subtitle URL is provided, disable auto-selected embedded subs.
+    // MPV would otherwise auto-activate the first embedded track (e.g. Italian signs+songs).
+    if (source.subtitleUrl.isEmpty) {
+      try {
+        final native = _player.platform as dynamic;
+        await native.setProperty('sid', 'no');
+      } catch (_) {}
+    }
     if (source.subtitleUrl.isNotEmpty) {
       await Future.delayed(const Duration(seconds: 1));
       if (!mounted) return;
       try {
-        await _player.setSubtitleTrack(SubtitleTrack.uri(source.subtitleUrl, title: 'English', language: 'en'));
-        print('[Player] Subtitle loaded: ${source.subtitleUrl}');
+        if (source.subtitleUrl.trim().startsWith('[')) {
+          final List<dynamic> list = jsonDecode(source.subtitleUrl);
+          if (list.isNotEmpty) {
+            final first = list[0];
+            final url = first['url']?.toString() ?? '';
+            final lang = first['lang']?.toString() ?? 'English';
+            final code = first['code']?.toString() ?? 'en';
+            if (url.isNotEmpty) {
+              await _player.setSubtitleTrack(SubtitleTrack.uri(url, title: lang, language: code));
+              await _applySubtitleStyle();
+              print('[Player] JSON Subtitle loaded: $lang -> $url');
+            }
+          }
+        } else {
+          await _player.setSubtitleTrack(SubtitleTrack.uri(source.subtitleUrl, title: 'English', language: 'en'));
+          await _applySubtitleStyle();
+          print('[Player] Subtitle loaded: ${source.subtitleUrl}');
+        }
       } catch (e) { print('[Player] Subtitle failed: $e'); }
+    }
+
+    // ── Resume Position ────────────────────────────────────────────────────────
+    Duration? seekTo = startPosition;
+    if (seekTo == null) {
+      final tmdbIdInt = int.tryParse(widget.tmdbId) ?? 0;
+      if (tmdbIdInt > 0) {
+        try {
+          final entry = await LocalDb.instance.getHistoryEntry(
+            tmdbIdInt,
+            seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
+            episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
+          );
+          if (entry != null && entry.progressSeconds > 5 && entry.durationSeconds > 0) {
+            final pct = entry.progressSeconds / entry.durationSeconds;
+            if (pct < 0.95) {
+              seekTo = Duration(seconds: entry.progressSeconds);
+              print('[Player] Watch history found for tmdbId=$tmdbIdInt: resuming at ${seekTo.inSeconds}s (progress: ${(pct * 100).toStringAsFixed(1)}%)');
+            } else {
+              print('[Player] Watch history found, but user watched ${(pct * 100).toStringAsFixed(1)}% (>95%) — starting from beginning');
+            }
+          }
+        } catch (e) {
+          print('[Player] Failed to load resume progress: $e');
+        }
+      }
+    }
+
+    if (seekTo != null && seekTo.inSeconds > 5) {
+      // Delay slightly for demuxer to start pushing frames before we seek
+      await Future.delayed(const Duration(milliseconds: 1000));
+      if (mounted) {
+        try {
+          print('[Player] Seeking to starting position: ${seekTo.inSeconds}s');
+          await _player.seek(seekTo);
+        } catch (err) {
+          print('[Player] Initial seek failed: $err');
+        }
+      }
     }
   }
 
@@ -448,16 +909,20 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   /// Fetches the HLS master.m3u8 via the local proxy (which handles UA + Referer
   /// correctly for both AniDB/Dalvik and AniDAO/vibeplayer) then parses quality variants.
   void _fetchHlsVariants(StreamSource source) async {
-    if (!source.url.contains('.m3u8')) return;
+    if (!source.url.contains('.m3u8') && !source.url.contains('/proxy/dash')) return;
 
-    // Build a proxy URL to fetch the master playlist — proxy handles per-provider headers
-    final encodedUrl = Uri.encodeComponent(source.url);
-    final encodedRef = Uri.encodeComponent(source.referer);
-    final proxyUrl = 'http://localhost:3000/proxy/hls?url=$encodedUrl&ref=$encodedRef';
+    final String fetchUrl;
+    if (source.url.contains('/proxy/dash')) {
+      fetchUrl = source.url;
+    } else {
+      final encodedUrl = Uri.encodeComponent(source.url);
+      final encodedRef = Uri.encodeComponent(source.referer);
+      fetchUrl = '${AppSettings.instance.backendUrl}/proxy/hls?url=$encodedUrl&ref=$encodedRef';
+    }
 
     try {
       // We use the existing node proxy to fetch with correct UA/Referer
-      final resp = await StreamResolver.dio.get<String>(proxyUrl,
+      final resp = await StreamResolver.dio.get<String>(fetchUrl,
           options: Options(responseType: ResponseType.plain, receiveTimeout: const Duration(seconds: 10)));
       if (resp.data == null || !mounted) return;
 
@@ -531,69 +996,132 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     } catch (_) {}
   }
 
-  /// Select a source from the panel — resolves a FRESH stream URL on demand.
-  /// Stops old playback immediately, carries over current position to new source.
+  /// Select a source from the panel — resolves a fresh stream URL on demand.
+  /// Stops old playback, clears buffers, and safely loads the new source.
+  /// Uses try/finally to ALWAYS reset _isSwitching even on error/unmount.
   Future<void> _selectEpisodeRef(int idx) async {
     if (idx < 0 || idx >= _episodeRefs.length) return;
-    final ref = _episodeRefs[idx];
+    if (_isSwitching) return;
+    _isSwitching = true;
 
-    // 1. Save current playback position BEFORE stopping
-    final savedPosition = _position;
+    try {
+      final ref = _episodeRefs[idx];
+      final savedPosition = _position;
 
-    // 2. Immediately pause the old source so it doesn't play in background
-    try { await _player.pause(); } catch (_) {}
+      // ── CRITICAL: hide the Video widget BEFORE touching the player ────────
+      // The Video widget renders from a native libmpv texture. If Flutter's
+      // render thread is reading that texture while we pause/abort/switch the
+      // player, we get an ntdll.dll 0xC0000005 access violation on Windows.
+      // Setting _loadState = fetching unmounts the Video widget so the render
+      // thread stops touching the native texture completely.
+      if (mounted) setState(() {
+        _loadState = _LoadState.fetching;
+        _loadStep = 'Switching source…';
+        _activeRefIdx = idx;
+        _isResolvingSource = true;
+        _panel = _PanelTab.none;
+        _showNextEp = false;
+        _nextEpCountdown = 5;
+      });
 
-    setState(() { _activeRefIdx = idx; _isResolvingSource = true; _panel = _PanelTab.none; });
+      // Give Flutter one frame to rebuild without the Video widget
+      await Future.delayed(const Duration(milliseconds: 32));
+      if (!mounted) return;
 
-    final src = await StreamResolver.instance.resolveStreamForEpisode(
-      provider: ref.provider,
-      episodeUrl: ref.episodeUrl,
-      quality: ref.quality,
-      size: ref.size,
-      label: ref.label,
-    );
+      // Safely drain the DASH demuxer buffer, then stop.
+      // See _safeSwitchPlayer() for full explanation.
+      await _safeSwitchPlayer();
+      if (!mounted) return;
 
-    if (!mounted) return;
-    setState(() => _isResolvingSource = false);
+      // Resolve the new stream URL
 
-    if (src != null) {
-      setState(() => _currentSource = src);
-      // Save language preference for AniDB
-      if (ref.provider == 'anidb') {
-        try {
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setString('preferred_anidb_lang', ref.quality);
-        } catch (_) {}
-      }
-      await _openSource(src);
-      // 3. Resume from saved position if meaningful (> 5 seconds)
-      if (savedPosition.inSeconds > 5) {
-        await Future.delayed(const Duration(milliseconds: 800));
+      // Resolve the new stream URL
+      final src = await StreamResolver.instance.resolveStreamForEpisode(
+        provider: ref.provider,
+        episodeUrl: ref.episodeUrl,
+        quality: ref.quality,
+        size: ref.size,
+        label: ref.label,
+      );
+
+      if (!mounted) return;
+      if (mounted) setState(() => _isResolvingSource = false);
+
+      if (src != null) {
+        if (mounted) setState(() => _currentSource = src);
+        if (ref.provider == 'anidb') {
+          try {
+            final prefs = await SharedPreferences.getInstance();
+            await prefs.setString('preferred_anidb_lang', ref.quality);
+          } catch (_) {}
+        }
+        await _openSource(src, startPosition: savedPosition);
+      } else {
         if (mounted) {
-          try { await _player.seek(savedPosition); } catch (_) {}
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Failed to load source. Try another.',
+                  style: GoogleFonts.inter(fontSize: 12, color: Colors.white)),
+              backgroundColor: Colors.red.shade900,
+              duration: const Duration(seconds: 3),
+            ),
+          );
         }
       }
-    } else {
-      // Failed — resume old source
-      try { await _player.play(); } catch (_) {}
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to load source. Try another.', style: GoogleFonts.inter(fontSize: 12)),
-            backgroundColor: Colors.red.shade900, duration: const Duration(seconds: 3)),
-      );
+    } catch (e) {
+      print('[Player] _selectEpisodeRef error: $e');
+      if (mounted) {
+        setState(() {
+          _isResolvingSource = false;
+          _error = 'Source switch failed: $e';
+          _loadState = _LoadState.error;
+        });
+      }
+    } finally {
+      _isSwitching = false;
     }
   }
 
-  void _onPlaybackError(String err) {
+  /// Fires [timeout] after _openSource if playback truly gets stuck.
+  /// Switches to next EpisodeRef when a stream fails to start.
+  /// Does NOT fire if MPV is actively buffering (_isBuffering=true).
+  void _schedulePlaybackWatchdog(StreamSource source, {required Duration timeout}) {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer(timeout, () {
+      if (!mounted) return;
+      // Stream is fine if position advanced OR MPV is actively buffering
+      if (_position > Duration.zero || _isBuffering) {
+        print('[Player] [Watchdog] OK (pos=${_position.inSeconds}s buf=$_isBuffering) — no switch');
+        return;
+      }
+      print('[Player] [Watchdog] Stuck after ${timeout.inSeconds}s → next source');
+      _onPlaybackError('Stream did not start after ${timeout.inSeconds}s');
+    });
+  }
+
+  Future<void> _onPlaybackError(String err) async {
     print('[Player] Playback error: $err');
+    if (!mounted) return;
+
+    // If the player is still in the middle of open() / demuxer init,
+    // don't try to stop or re-open — we'd interrupt the init and crash.
+    if (_isPlayerBusy) {
+      print('[Player] _onPlaybackError: player busy (init), ignoring error');
+      return;
+    }
+
     if (_currentSource == null) {
-      setState(() { _error = err; _loadState = _LoadState.error; });
+      if (mounted) setState(() { _error = err; _loadState = _LoadState.error; });
+      return;
+    }
+
+    // If we're already switching, don't layer another switch on top
+    if (_isSwitching) {
+      print('[Player] _onPlaybackError: switch already in progress, ignoring');
       return;
     }
 
     final cur = _currentSource!;
-
-    // For TCP errors on local proxy (connection dropped, etc.) — skip to next source
-    // The proxy URL already IS the fallback; if it failed, go to next
     final isProxyError = cur.url.contains('127.0.0.1') || cur.url.contains('localhost');
 
     // If direct CDN URL failed, try the proxyUrl as fallback
@@ -603,10 +1131,19 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         provider: cur.provider, label: '${cur.label} [Proxy]',
         quality: cur.quality, size: cur.size,
         url: cur.fallbackUrl, fallbackUrl: '',
-        referer: cur.referer, subtitleUrl: cur.subtitleUrl, episodeUrl: cur.episodeUrl,
+        referer: cur.referer, subtitleUrl: cur.subtitleUrl,
+        episodeUrl: cur.episodeUrl, cookie: cur.cookie,
       );
-      setState(() => _currentSource = fallback);
-      _openSource(fallback);
+      if (mounted) setState(() {
+        _loadState = _LoadState.fetching;
+        _loadStep = 'Trying fallback source…';
+        _currentSource = fallback;
+      });
+      // Wait one frame for the Video widget to unmount before switching
+      await Future.delayed(const Duration(milliseconds: 32));
+      if (!mounted) return;
+      await _safeSwitchPlayer();
+      if (mounted) _openSource(fallback, startPosition: _position);
       return;
     }
 
@@ -614,40 +1151,368 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     final nextIdx = _activeRefIdx + 1;
     if (nextIdx < _episodeRefs.length) {
       print('[Player] Trying next source ($nextIdx/${_episodeRefs.length})...');
-      // Go back to animated loading screen while we try the next source
-      setState(() {
+      if (mounted) setState(() {
         _loadState = _LoadState.fetching;
         _loadStep = 'Trying another source ($nextIdx/${_episodeRefs.length})…';
       });
+      _isSwitching = false;
       _selectEpisodeRef(nextIdx);
     } else if (_episodeRefs.isEmpty && cur.episodeUrl.isNotEmpty) {
-      // No refs loaded yet — show error
-      setState(() { _error = err; _loadState = _LoadState.error; });
+      if (mounted) setState(() { _error = err; _loadState = _LoadState.error; });
     } else {
-      setState(() { _error = err; _loadState = _LoadState.error; });
+      if (mounted) setState(() { _error = err; _loadState = _LoadState.error; });
     }
   }
 
   void _saveHistory() async {
     final tmdbIdInt = int.tryParse(widget.tmdbId) ?? 0;
     if (tmdbIdInt <= 0) return;
-    await LocalDb.instance.saveHistory(WatchHistory(
-      tmdbId: tmdbIdInt, title: widget.title, posterUrl: '',
-      mediaType: widget.mediaType,
-      seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
-      episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
-      episodeTitle: widget.episodeTitle.isEmpty ? null : widget.episodeTitle,
-      progressSeconds: 0, durationSeconds: 0, lastWatchedAt: DateTime.now(),
-    ));
+    try {
+      await LocalDb.instance.saveHistory(WatchHistory(
+        tmdbId: tmdbIdInt, title: widget.title, posterUrl: '',
+        mediaType: widget.mediaType,
+        seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
+        episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
+        episodeTitle: widget.episodeTitle.isEmpty ? null : widget.episodeTitle,
+        progressSeconds: 0, durationSeconds: 0, lastWatchedAt: DateTime.now(),
+      ));
+    } catch (_) {}
+    // Cancel any existing progress timer before creating a new one
+    // (prevents timer accumulation when switching sources)
+    _progressTimer?.cancel();
     _progressTimer = Timer.periodic(const Duration(seconds: 10), (_) async {
+      if (!mounted) return;
       if (_duration.inSeconds > 0) {
-        await LocalDb.instance.updateProgress(tmdbIdInt,
-          seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
-          episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
-          progressSeconds: _position.inSeconds, durationSeconds: _duration.inSeconds,
-        );
+        try {
+          await LocalDb.instance.updateProgress(tmdbIdInt,
+            seasonNumber: widget.seasonNumber.isEmpty ? null : widget.seasonNumber,
+            episodeNumber: widget.episodeNumber.isEmpty ? null : widget.episodeNumber,
+            progressSeconds: _position.inSeconds, durationSeconds: _duration.inSeconds,
+          );
+        } catch (_) {}
       }
     });
+  }
+
+  Future<void> _resolveAnimeIds(String title) async {
+    if (_malId != null && _anilistId != null) return;
+    try {
+      final query = """
+      query (\$search: String) {
+        Media(search: \$search, type: ANIME) {
+          id
+          idMal
+        }
+      }
+      """;
+      final dio = Dio();
+      final res = await dio.post(
+        'https://graphql.anilist.co',
+        data: {
+          'query': query,
+          'variables': {'search': title},
+        },
+      );
+      if (res.statusCode == 200 && res.data != null) {
+        final media = res.data['data']?['Media'];
+        if (media != null) {
+          _anilistId = media['id'] as int?;
+          _malId = media['idMal'] as int?;
+          print('[AniList] Resolved AniList ID: $_anilistId, MAL ID: $_malId');
+        }
+      }
+    } catch (e) {
+      print('[AniList] Error resolving Anime IDs for "$title": $e');
+    }
+  }
+
+  Future<List<SkipInterval>> _fetchAnimeSkipTimes(int anilistId) async {
+    try {
+      final query = """
+      query (\$anilistId: String!) {
+        findShowsByExternalId(service: ANILIST, serviceId: \$anilistId) {
+          episodes {
+            number
+            absoluteNumber
+            timestamps {
+              at
+              type {
+                name
+              }
+            }
+          }
+        }
+      }
+      """;
+
+      print('[Anime-Skip] Fetching timestamps for AniList ID: $anilistId');
+      final dio = Dio();
+      final res = await dio.post(
+        'https://api.anime-skip.com/graphql',
+        options: Options(
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Client-ID': 'ZGfO0sMF3eCwLYf8yMSCJjlynwNGRXWE',
+          },
+        ),
+        data: {
+          'query': query,
+          'variables': {'anilistId': anilistId.toString()},
+        },
+      );
+
+      if (res.statusCode == 200 && res.data != null) {
+        final shows = res.data['data']?['findShowsByExternalId'];
+        if (shows is List && shows.isNotEmpty) {
+          final show = shows[0];
+          final episodes = show['episodes'];
+          if (episodes is List) {
+            final targetEpStr = widget.episodeNumber;
+            // Try to find the episode matching targetEpStr
+            var ep = episodes.firstWhere(
+              (e) => e['number'] == targetEpStr || e['absoluteNumber'] == targetEpStr,
+              orElse: () => null,
+            );
+
+            // If not found directly, try parsing numbers
+            if (ep == null) {
+              final targetEpNum = double.tryParse(targetEpStr);
+              if (targetEpNum != null) {
+                ep = episodes.firstWhere(
+                  (e) {
+                    final epNum = double.tryParse(e['number'] ?? '');
+                    final absNum = double.tryParse(e['absoluteNumber'] ?? '');
+                    return epNum == targetEpNum || absNum == targetEpNum;
+                  },
+                  orElse: () => null,
+                );
+              }
+            }
+
+            if (ep != null) {
+              final timestamps = ep['timestamps'];
+              if (timestamps is List && timestamps.isNotEmpty) {
+                // Sort timestamps by 'at' ascending
+                final List<Map<String, dynamic>> sortedTs = timestamps
+                    .map((t) => Map<String, dynamic>.from(t as Map))
+                    .toList();
+                sortedTs.sort((a, b) {
+                  final aAt = (a['at'] as num).toDouble();
+                  final bAt = (b['at'] as num).toDouble();
+                  return aAt.compareTo(bAt);
+                });
+
+                final List<SkipInterval> intervals = [];
+                for (int i = 0; i < sortedTs.length; i++) {
+                  final ts = sortedTs[i];
+                  final typeName = ts['type']?['name'] as String?;
+                  if (typeName == 'Intro' || typeName == 'Credits' || typeName == 'Recap') {
+                    final startTime = (ts['at'] as num).toDouble();
+                    // End time is either the next timestamp's 'at' or the episode length (duration)
+                    double endTime = _duration.inSeconds.toDouble();
+                    if (i + 1 < sortedTs.length) {
+                      endTime = (sortedTs[i + 1]['at'] as num).toDouble();
+                    }
+
+                    // Map Anime-Skip names to app-expected types
+                    String skipType = 'op';
+                    if (typeName == 'Credits') {
+                      skipType = 'ed';
+                    } else if (typeName == 'Recap') {
+                      skipType = 'recap';
+                    }
+
+                    // Ensure start and end times make sense
+                    if (endTime > startTime && startTime >= 0) {
+                      intervals.add(SkipInterval(
+                        startTime: startTime,
+                        endTime: endTime,
+                        type: skipType,
+                      ));
+                    }
+                  }
+                }
+                print('[Anime-Skip] Successfully parsed ${intervals.length} intervals');
+                return intervals;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('[Anime-Skip] Error fetching timestamps: $e');
+    }
+    return [];
+  }
+
+  Future<void> _fetchSkipTimes() async {
+    final currentProv = widget.preloadedProvider ?? _currentSource?.provider;
+    final isAnime = widget.isAnime ||
+        currentProv?.toLowerCase() == 'anidb' ||
+        currentProv?.toLowerCase() == 'anidao';
+    if (!isAnime) return;
+
+    if (_duration.inSeconds <= 0) return;
+    if (_skipTimesLoaded) return;
+    _skipTimesLoaded = true;
+
+    try {
+      await _resolveAnimeIds(widget.title);
+      final malId = _malId;
+      final anilistId = _anilistId;
+
+      List<SkipInterval> intervals = [];
+
+      // Try AniSkip first if malId is resolved
+      if (malId != null) {
+        final epNum = double.tryParse(widget.episodeNumber) ?? 1.0;
+        final epLength = _duration.inSeconds.toDouble();
+        final url = 'https://api.aniskip.com/v2/skip-times/$malId/$epNum?types[]=op&types[]=ed&types[]=recap&episodeLength=$epLength';
+        print('[AniSkip] Fetching skip times: $url');
+
+        final dio = Dio();
+        try {
+          final res = await dio.get(url, options: Options(
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+            validateStatus: (status) => status != null && status < 600,
+          ));
+          print('[AniSkip] Response status: ${res.statusCode}');
+          if (res.statusCode == 200 && res.data != null) {
+            final data = res.data;
+            final dataStatus = data['statusCode'];
+            if (dataStatus == 200 && data['results'] != null) {
+              final List<dynamic> results = data['results'];
+              for (final r in results) {
+                final interval = r['interval'];
+                if (interval != null) {
+                  intervals.add(SkipInterval(
+                    startTime: (interval['startTime'] as num).toDouble(),
+                    endTime: (interval['endTime'] as num).toDouble(),
+                    type: r['skipType'] ?? 'op',
+                  ));
+                }
+              }
+            }
+          }
+        } catch (e) {
+          print('[AniSkip] Error querying AniSkip API: $e');
+        }
+      }
+
+      // If AniSkip returned nothing (or is down), try Anime-Skip fallback using anilistId
+      if (intervals.isEmpty && anilistId != null) {
+        print('[Anime-Skip] Trying Anime-Skip GraphQL fallback...');
+        intervals = await _fetchAnimeSkipTimes(anilistId);
+      }
+
+      if (intervals.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            _skipIntervals = intervals;
+          });
+          print('[AniSkip/Anime-Skip] Loaded ${intervals.length} skip intervals');
+        }
+      } else {
+        print('[AniSkip/Anime-Skip] No skip times resolved.');
+      }
+    } catch (e) {
+      print('[AniSkip] Error resolving skip times: $e');
+    }
+  }
+
+  Future<void> _fetchChapters() async {
+    try {
+      final native = _player.platform as dynamic;
+      final String? listStr = await native.getProperty('chapter-list');
+      if (listStr != null && listStr.isNotEmpty) {
+        final List<dynamic> list = jsonDecode(listStr);
+        final List<MediaChapter> chaptersList = [];
+
+        for (var i = 0; i < list.length; i++) {
+          final item = list[i];
+          final String title = item['title'] ?? 'Chapter ${i + 1}';
+          final double timeSecs = (item['time'] as num).toDouble();
+          chaptersList.add(MediaChapter(
+            title: title,
+            time: Duration(seconds: timeSecs.round()),
+          ));
+        }
+
+        if (mounted) {
+          setState(() {
+            _chapters = chaptersList;
+          });
+          print('[Player] Loaded ${chaptersList.length} chapters from MPV');
+
+          // ── Build skip intervals from chapter names when AniSkip has no data ──
+          // Only do this if AniSkip didn't already load intervals.
+          if (_skipIntervals.isEmpty && chaptersList.length >= 2) {
+            final List<SkipInterval> intervals = [];
+            for (var i = 0; i < chaptersList.length; i++) {
+              final ch = chaptersList[i];
+              final title = (ch.title ?? '').toLowerCase();
+              String? type;
+              if (title.contains('opening') || title == 'op') {
+                type = 'op';
+              } else if (title.contains('ending') || title == 'ed') {
+                type = 'ed';
+              } else if (title.contains('recap') || title.contains('preview')) {
+                type = 'recap';
+              }
+              if (type != null) {
+                // The interval runs from this chapter's start to the next chapter's start.
+                final start = ch.time.inSeconds.toDouble();
+                final end = i + 1 < chaptersList.length
+                    ? chaptersList[i + 1].time.inSeconds.toDouble()
+                    : start + 90; // fallback: 90s if it's the last chapter
+                intervals.add(SkipInterval(startTime: start, endTime: end, type: type));
+                print('[Chapters] Skip interval from chapter "${ch.title}": ${start}s → ${end}s ($type)');
+              }
+            }
+            if (intervals.isNotEmpty && mounted) {
+              setState(() => _skipIntervals = intervals);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('[Player] Error loading chapters from MPV: $e');
+    }
+  }
+
+  bool _shouldShowSkipButton() {
+    final secs = _position.inSeconds.toDouble();
+    for (final interval in _skipIntervals) {
+      if (secs >= interval.startTime && secs <= interval.endTime) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  String _skipButtonLabel() {
+    final secs = _position.inSeconds.toDouble();
+    for (final interval in _skipIntervals) {
+      if (secs >= interval.startTime && secs <= interval.endTime) {
+        if (interval.type == 'op') return 'Skip Opening';
+        if (interval.type == 'ed') return 'Skip Ending';
+        if (interval.type == 'recap') return 'Skip Recap';
+        return 'Skip Segment';
+      }
+    }
+    return 'Skip';
+  }
+
+  void _skipToNextSegment() {
+    final secs = _position.inSeconds.toDouble();
+    for (final interval in _skipIntervals) {
+      if (secs >= interval.startTime && secs <= interval.endTime) {
+        _player.seek(Duration(seconds: interval.endTime.round()));
+        break;
+      }
+    }
   }
 
   // ── Next Episode ─────────────────────────────────────────────────────────────
@@ -695,13 +1560,40 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     setState(() { _showNextEp = false; _nextEpCountdown = 5; });
   }
 
-  void _goNextEpisode() {
+  void _goNextEpisode() async {
+    // ── CRITICAL: abort + drain + pause BEFORE navigating ───────────────────────
+    // GoRouter.pushReplacement calls dispose() on this screen synchronously.
+    // dispose() cannot await, so if there are active segment downloads
+    // when _player.dispose() runs, ntdll.dll crashes (write to freed ring buffer).
+    // We must stop all downloads and pause the player BEFORE navigating.
+    _watchdogTimer?.cancel();
+    _bufferPollTimer?.cancel();
+    _nextEpTimer?.cancel();
+    _progressTimer?.cancel();
+    for (final s in _subs) { try { s.cancel(); } catch (_) {} }
+    _subs.clear();
+    // Abort proxy downloads
+    try {
+      await Dio().get('${AppSettings.instance.backendUrl}/proxy/abort-all')
+          .timeout(const Duration(milliseconds: 600));
+    } catch (_) {}
+    // Drain demuxer
+    try {
+      final native = _player.platform as dynamic;
+      native.setProperty('demuxer-max-bytes', '1');
+      native.setProperty('cache', 'no');
+    } catch (_) {}
+    // Pause player
+    try { await _player.pause(); } catch (_) {}
+    // Wait for ring-buffer writes to settle
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return;
+
     final nextEp = (int.tryParse(widget.episodeNumber) ?? 0) + 1;
     if (nextEp <= 0) return;
-    // If we have a preloaded source, play it directly (no loading wait)
     final preloaded = _preloadedNextSrc;
-    // Use the widget's season number (next episode is always in the same season)
     final season = widget.seasonNumber;
+    final currentProv = preloaded?.provider ?? widget.preloadedProvider ?? _currentSource?.provider;
     GoRouter.of(context).pushReplacement('/player', extra: <String, dynamic>{
       'tmdbId': widget.tmdbId,
       'mediaType': widget.mediaType,
@@ -714,7 +1606,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       'backdrop': _backdropUrl,
       'logo': _logoUrl,
       if (preloaded != null) 'preloadedUrl': preloaded.url,
-      if (preloaded != null) 'preloadedProvider': preloaded.provider,
+      'preloadedProvider': currentProv,
+      'showUrl': widget.showUrl,
     });
   }
 
@@ -732,14 +1625,158 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     if (_showControls && _panel == _PanelTab.none) _scheduleHide();
   }
 
+  void _debouncedSeek(Duration target) {
+    _targetSeekPosition = target;
+    setState(() => _position = target);
+
+    _seekDebounceTimer?.cancel();
+    _seekDebounceTimer = Timer(const Duration(milliseconds: 200), () async {
+      // Don't seek if the player is in the middle of a source switch or open().
+      // Calling seek() while libmpv is initialising a new demuxer crashes on Windows.
+      if (_isSwitching || _isPlayerBusy) {
+        if (mounted) setState(() { _targetSeekPosition = null; });
+        return;
+      }
+      final pos = _targetSeekPosition;
+      if (pos != null) {
+        try {
+          await _player.seek(pos);
+        } catch (e) {
+          print('[Player] Debounced seek error: $e');
+        }
+        if (mounted) {
+          setState(() {
+            _targetSeekPosition = null;
+          });
+        }
+      }
+    });
+  }
+
   void _seek(int secs) {
-    _player.seek(_position + Duration(seconds: secs));
+    final current = _targetSeekPosition ?? _position;
+    var target = current + Duration(seconds: secs);
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > _duration) target = _duration;
+
+    _debouncedSeek(target);
+
     // Flash animation
     _seekFlashTimer?.cancel();
     setState(() => _seekFlash = secs > 0 ? 1 : -1);
     _seekFlashTimer = Timer(const Duration(milliseconds: 700), () {
       if (mounted) setState(() => _seekFlash = 0);
     });
+  }
+
+  void _showCastDialog() {
+    final castService = CastService();
+    castService.startDiscovery();
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StreamBuilder<List<CastDevice>>(
+          stream: castService.devices,
+          initialData: castService.currentDevices,
+          builder: (context, snapshot) {
+            final devices = snapshot.data ?? [];
+            return AlertDialog(
+              backgroundColor: AppColors.surface,
+              title: Row(
+                children: [
+                  const Icon(Icons.cast_rounded, color: AppColors.accent),
+                  const SizedBox(width: 10),
+                  Text('Cast to Device', style: GoogleFonts.inter(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                ],
+              ),
+              content: SizedBox(
+                width: 300,
+                child: devices.isEmpty
+                    ? Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(height: 16),
+                          const SizedBox(
+                            width: 24,
+                            height: 24,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.accent),
+                          ),
+                          const SizedBox(height: 16),
+                          Text('Searching for local devices...', style: GoogleFonts.inter(color: Colors.white70, fontSize: 13)),
+                          const SizedBox(height: 8),
+                        ],
+                      )
+                    : ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: devices.length,
+                        itemBuilder: (context, index) {
+                          final dev = devices[index];
+                          return ListTile(
+                            leading: const Icon(Icons.tv_rounded, color: Colors.white54),
+                            title: Text(dev.name, style: GoogleFonts.inter(color: Colors.white, fontSize: 14)),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _startCasting(dev);
+                            },
+                          );
+                        },
+                      ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    castService.stopDiscovery();
+                    Navigator.pop(ctx);
+                  },
+                  child: Text('Cancel', style: GoogleFonts.inter(color: AppColors.accent)),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    ).then((_) {
+      castService.stopDiscovery();
+    });
+  }
+
+  void _startCasting(CastDevice dev) async {
+    if (_currentSource == null) return;
+    _player.pause();
+    setState(() {
+      _activeCastDevice = dev;
+    });
+
+    final success = await CastService().castVideo(
+      dev,
+      _currentSource!.url,
+      title: widget.title,
+    );
+
+    if (!success) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to cast to device.')),
+        );
+        setState(() {
+          _activeCastDevice = null;
+        });
+        _player.play();
+      }
+    }
+  }
+
+  void _stopCasting() async {
+    if (_activeCastDevice != null) {
+      await CastService().stopVideo(_activeCastDevice!);
+      if (mounted) {
+        setState(() {
+          _activeCastDevice = null;
+        });
+        _player.play();
+      }
+    }
   }
 
   /// Set video aspect ratio via MPV panscan/keepaspect.
@@ -792,6 +1829,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     try {
       final prefs = await SharedPreferences.getInstance();
       final prefLang = prefs.getString('preferred_anidb_lang') ?? 'Sub';
+      final currentProv = widget.preloadedProvider ?? _currentSource?.provider;
 
       final src = await StreamResolver.instance.resolveFirstSource(
         title: widget.title, mediaType: widget.mediaType,
@@ -799,6 +1837,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         episodeNumber: '$nextEpNum',
         preferredQuality: prefLang,
         isAnime: widget.isAnime,
+        provider: currentProv,
       );
       if (mounted && src != null) setState(() => _preloadedNextSrc = src);
     } catch (_) {} finally {
@@ -812,7 +1851,27 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       final prefs = await SharedPreferences.getInstance();
       if (mounted) setState(() {
         _pauseOnFocusLoss = prefs.getBool('pauseOnFocusLoss') ?? true;
+        _subSize = prefs.getString('subSize') ?? '55';
+        _subColor = prefs.getString('subColor') ?? '#FFFFFFFF';
+        _subBgColor = prefs.getString('subBgColor') ?? '#80000000';
       });
+      Future.delayed(const Duration(milliseconds: 200), _applySubtitleStyle);
+    } catch (_) {}
+  }
+
+  Future<void> _applySubtitleStyle() async {
+    try {
+      final native = _player.platform as dynamic;
+      await native.setProperty('sub-font', 'sans-serif');
+      await native.setProperty('sub-font-size', _subSize);
+      await native.setProperty('sub-color', _subColor);
+      await native.setProperty('sub-back-color', _subBgColor);
+      // 'yes' respects embedded ASS styling but applies our overrides on top.
+      // 'force' caused a second plain-text render pass → doubled subtitles.
+      await native.setProperty('sub-ass-override', 'yes');
+      await native.setProperty('sub-border-size', '2');
+      await native.setProperty('sub-border-color', '#FF000000'); // black outline
+      await native.setProperty('sub-shadow-offset', '0'); // no shadow offset
     } catch (_) {}
   }
 
@@ -955,14 +2014,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
               ),
             ),
 
-          // Source-resolving overlay — use the same animated buffering logo, no extra spinner
-          if (_isResolvingSource && _loadState == _LoadState.playing)
-            Positioned.fill(
-              child: _BufferingOverlay(
-                title: widget.title,
-                logoUrl: _logoUrl,
-              ),
-            ),
+          // Source switching happens silently — no overlay shown
 
           // ── Netflix-style Next Episode card ────────────────────────────────
           if (_loadState == _LoadState.playing && _showNextEp && widget.mediaType == 'tv')
@@ -974,6 +2026,93 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                 showCountdown: _nextEpTimer != null,
                 onPlay: _goNextEpisode,
                 onCancel: _cancelNextEp,
+              ),
+            ),
+
+          // ── Skip Intro Button ──────────────────────────────────────────────
+          // Movies: never show skip button (no intros/outros).
+          // Series (anime + non-anime): only show when AniSkip data is loaded.
+          // No hardcoded fallbacks — skip button only appears with real timestamps.
+          if (_loadState == _LoadState.playing &&
+              widget.mediaType == 'tv' &&
+              _shouldShowSkipButton())
+            Positioned(
+              bottom: 100, right: 24,
+              child: GestureDetector(
+                onTap: _skipToNextSegment,
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 200),
+                    curve: Curves.easeOut,
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.80),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: Colors.white38, width: 0.8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.skip_next_rounded, color: Colors.white, size: 20),
+                        const SizedBox(width: 8),
+                        Text(
+                          _skipButtonLabel(),
+                          style: GoogleFonts.inter(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // ── DLNA Casting Overlay ───────────────────────────────────────────
+          if (_activeCastDevice != null)
+            Positioned.fill(
+              child: Container(
+                color: Colors.black,
+                child: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.cast_connected_rounded, size: 80, color: AppColors.accent),
+                      const SizedBox(height: 24),
+                      Text(
+                        'Casting to ${_activeCastDevice!.name}',
+                        style: GoogleFonts.inter(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        widget.title,
+                        style: GoogleFonts.inter(
+                          color: Colors.white70,
+                          fontSize: 14,
+                        ),
+                      ),
+                      const SizedBox(height: 40),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
+                        ),
+                        onPressed: _stopCasting,
+                        icon: const Icon(Icons.cast_connected_rounded),
+                        label: Text('Stop Casting', style: GoogleFonts.inter(fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
 
@@ -1006,11 +2145,12 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           subtitle: widget.episodeTitle.isNotEmpty ? widget.episodeTitle
               : widget.seasonNumber.isNotEmpty ? 'S${widget.seasonNumber} · E${widget.episodeNumber}' : '',
           step: _loadStep,
-          onBack: () => GoRouter.of(context).pop(),
+          onBack: () => _safeNavigateBack(),
         ),
       _LoadState.error => _ErrorOverlay(error: _error ?? 'Unknown error',
-          onRetry: _resolveAndPlay, onBack: () => GoRouter.of(context).pop()),
+          onRetry: _resolveAndPlay, onBack: () => _safeNavigateBack()),
       _LoadState.playing => Video(
+          key: ValueKey(_playerGeneration), // remounts when player is rebuilt
           controller: _videoCtrl,
           controls: NoVideoControls,
           fill: Colors.black,
@@ -1040,7 +2180,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           child: Row(children: [
-            _CtrlBtn(icon: Icons.arrow_back_rounded, onTap: () => GoRouter.of(context).pop()),
+            _CtrlBtn(icon: Icons.arrow_back_rounded, onTap: () => _safeNavigateBack()),
             const SizedBox(width: 12),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis,
@@ -1085,6 +2225,23 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             _PanelBtn(icon: Icons.settings_rounded, label: 'Settings',
               active: _panel == _PanelTab.quality || _panel == _PanelTab.subtitles,
               onTap: () => _togglePanel(_PanelTab.quality)),
+            const SizedBox(width: 6),
+            if (_chapters.isNotEmpty) ...[
+              _PanelBtn(
+                icon: Icons.bookmarks_rounded,
+                label: 'Chapters (${_chapters.length})',
+                active: _panel == _PanelTab.chapters,
+                onTap: () => _togglePanel(_PanelTab.chapters),
+              ),
+              const SizedBox(width: 6),
+            ],
+            // Cast button
+            _PanelBtn(
+              icon: _activeCastDevice != null ? Icons.cast_connected_rounded : Icons.cast_rounded,
+              label: _activeCastDevice != null ? 'Casting' : 'Cast',
+              active: false,
+              onTap: _showCastDialog,
+            ),
           ]),
         ),
       ),
@@ -1116,8 +2273,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
               onSeekUpdate: (v) => setState(() => _dragValue = v),
               onSeekEnd: (v) {
                 final ms = (v * _duration.inMilliseconds).round();
-                setState(() { _isDragging = false; _position = Duration(milliseconds: ms); });
-                _player.seek(Duration(milliseconds: ms));
+                setState(() => _isDragging = false);
+                _debouncedSeek(Duration(milliseconds: ms));
                 _scheduleHide();
               },
             ),
@@ -1310,13 +2467,47 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             activeVariantBandwidth: _activeVariantBandwidth,
             aspectRatio: _aspectRatio,
             pauseOnFocusLoss: _pauseOnFocusLoss,
+            subSize: _subSize,
+            subColor: _subColor,
+            subBgColor: _subBgColor,
             onVideoTrack: (t) { _player.setVideoTrack(t); setState(() => _activeVideo = t); },
             onAudioTrack: (t) { _player.setAudioTrack(t); setState(() => _activeAudio = t); },
-            onSubtitleTrack: (t) { _player.setSubtitleTrack(t); setState(() => _activeSubtitle = t); },
+            onSubtitleTrack: (t) async {
+              await _player.setSubtitleTrack(t);
+              await _applySubtitleStyle();
+              setState(() => _activeSubtitle = t);
+            },
             onTabChange: (t) => setState(() => _panel = t),
             onSetHlsBitrate: _setHlsBitrate,
             onSetAspectRatio: _setAspectRatio,
             onSetPauseOnFocusLoss: _savePauseOnFocusLoss,
+            onSetSubSize: (val) async {
+              setState(() => _subSize = val);
+              await _applySubtitleStyle();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('subSize', val);
+            },
+            onSetSubColor: (val) async {
+              setState(() => _subColor = val);
+              await _applySubtitleStyle();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('subColor', val);
+            },
+            onSetSubBgColor: (val) async {
+              setState(() => _subBgColor = val);
+              await _applySubtitleStyle();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('subBgColor', val);
+            },
+            onClose: () => setState(() => _panel = _PanelTab.none),
+          ),
+        _PanelTab.chapters => _ChaptersPanel(
+            chapters: _chapters,
+            position: _position,
+            onSelect: (time) {
+              _player.seek(time);
+              setState(() => _panel = _PanelTab.none);
+            },
             onClose: () => setState(() => _panel = _PanelTab.none),
           ),
         _PanelTab.none => const SizedBox.shrink(),
@@ -1324,28 +2515,28 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     );
   }
 
-  /// Load all seasons for the Episodes panel dropdown — uses SIMKL
+  /// Load all seasons for the Episodes panel dropdown — uses TMDB
   Future<void> _loadAllSeasons() async {
     if (widget.mediaType != 'tv') return;
-    final sid = await _resolveSimklId();
-    if (sid <= 0) return;
+    final tmdbId = int.tryParse(widget.tmdbId) ?? 0;
+    if (tmdbId <= 0) return;
     try {
-      final detail = await SimklApi.instance.getDetails(sid, widget.mediaType);
+      final detail = await TmdbApi.instance.getDetails(tmdbId, widget.mediaType);
       if (mounted && detail.seasons.isNotEmpty) {
         setState(() => _allSeasons = detail.seasons);
       }
     } catch (_) {}
   }
 
-  /// Asynchronously fetch backdrop image and logo URL if missing — uses SIMKL
+  /// Asynchronously fetch backdrop image and logo URL if missing — uses TMDB
   Future<void> _fetchMediaDetailsIfNeeded() async {
     final needBack = _backdropUrl == null || _backdropUrl!.isEmpty;
     final needLogo = _logoUrl == null || _logoUrl!.isEmpty;
     if (!needBack && !needLogo) return;
-    final sid = await _resolveSimklId();
-    if (sid <= 0) return;
+    final tmdbId = int.tryParse(widget.tmdbId) ?? 0;
+    if (tmdbId <= 0) return;
     try {
-      final detail = await SimklApi.instance.getDetails(sid, widget.mediaType);
+      final detail = await TmdbApi.instance.getDetails(tmdbId, widget.mediaType);
       if (mounted) {
         setState(() {
           if (needBack && detail.backdropUrl.isNotEmpty) _backdropUrl = detail.backdropUrl;
@@ -1355,46 +2546,40 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     } catch (_) {}
   }
 
-  /// Resolve the SIMKL ID: prefer widget.simklId, else look up from TMDB ID
-  Future<int> _resolveSimklId() async {
-    if (widget.simklId > 0) return widget.simklId;
-    final tmdbId = int.tryParse(widget.tmdbId) ?? 0;
-    if (tmdbId <= 0) return 0;
-    return SimklApi.instance.simklIdFromTmdb(tmdbId, widget.mediaType);
-  }
+  // (unused — kept for compatibility)
 
-  /// Load SIMKL season episodes for the Episodes panel
+  /// Load TMDB season episodes for the Episodes panel
   Future<void> _loadTmdbEpisodes({int? seasonOverride}) async {
     if (_tmdbEpisodesLoading) return;
+    final tmdbId = int.tryParse(widget.tmdbId) ?? 0;
     final season = seasonOverride ?? _selectedSeasonNumber;
+    if (tmdbId <= 0) { if (mounted) setState(() => _tmdbEpisodesLoading = false); return; }
     setState(() { _tmdbEpisodesLoading = true; _tmdbEpisodes = []; });
     try {
-      final sid = await _resolveSimklId();
-      if (sid <= 0) { if (mounted) setState(() => _tmdbEpisodesLoading = false); return; }
-      final eps = await SimklApi.instance.getSeasonEpisodes(sid, season);
+      final eps = await TmdbApi.instance.getSeasonEpisodes(tmdbId, season);
       if (mounted) setState(() { _tmdbEpisodes = eps; _tmdbEpisodesLoading = false; });
     } catch (e) {
       debugPrint('[Player] _loadTmdbEpisodes failed: $e');
       await Future.delayed(const Duration(seconds: 2));
       if (!mounted) return;
       try {
-        final sid = await _resolveSimklId();
-        if (sid > 0) {
-          final eps = await SimklApi.instance.getSeasonEpisodes(sid, season);
-          if (mounted) setState(() { _tmdbEpisodes = eps; _tmdbEpisodesLoading = false; });
-        } else {
-          if (mounted) setState(() => _tmdbEpisodesLoading = false);
-        }
+        final eps = await TmdbApi.instance.getSeasonEpisodes(tmdbId, season);
+        if (mounted) setState(() { _tmdbEpisodes = eps; _tmdbEpisodesLoading = false; });
       } catch (_) {
         if (mounted) setState(() => _tmdbEpisodesLoading = false);
       }
     }
   }
 
-  void _playTmdbEpisode(TmdbEpisode ep) {
+  /// Navigate to a different TMDB episode.
+  /// Drains the DASH demuxer before pushReplacement so dispose() is safe.
+  Future<void> _playTmdbEpisode(TmdbEpisode ep) async {
+    if (!mounted) return;
+    await _safeSwitchPlayer();
+    if (!mounted) return;
+    final currentProv = widget.preloadedProvider ?? _currentSource?.provider;
     GoRouter.of(context).pushReplacement('/player', extra: <String, dynamic>{
       'tmdbId': widget.tmdbId,
-      'simklId': widget.simklId,
       'mediaType': widget.mediaType,
       'title': widget.title,
       'year': widget.year,
@@ -1404,7 +2589,33 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       'isAnime': widget.isAnime,
       'backdrop': _backdropUrl,
       'logo': _logoUrl,
+      'preloadedProvider': currentProv,
+      'showUrl': widget.showUrl,
     });
+  }
+
+  /// Safe back navigation — drains DASH demuxer before popping route.
+  /// Without this, dispose() fires mid-write → ntdll.dll crash.
+  Future<void> _safeNavigateBack() async {
+    if (!mounted) return;
+    // Abort proxy downloads + drain demuxer BEFORE pop() triggers dispose().
+    // dispose() is synchronous and cannot await, so we must stop downloads here.
+    _watchdogTimer?.cancel();
+    _bufferPollTimer?.cancel();
+    _progressTimer?.cancel();
+    try {
+      await Dio().get('${AppSettings.instance.backendUrl}/proxy/abort-all')
+          .timeout(const Duration(milliseconds: 600));
+    } catch (_) {}
+    try {
+      final native = _player.platform as dynamic;
+      native.setProperty('demuxer-max-bytes', '1');
+      native.setProperty('cache', 'no');
+    } catch (_) {}
+    try { await _player.pause(); } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 300));
+    if (!mounted) return;
+    GoRouter.of(context).pop();
   }
 
 
@@ -1422,7 +2633,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         } else if (_isFullscreen) {
           _toggleFullscreen();
         } else {
-          GoRouter.of(context).pop();
+          _safeNavigateBack(); // abort + drain before pop
         }
       case LogicalKeyboardKey.keyS: _togglePanel(_PanelTab.sources);
       default: break;
@@ -1868,6 +3079,9 @@ class _SettingsPanel extends StatelessWidget {
   final int activeVariantBandwidth;
   final String aspectRatio;
   final bool pauseOnFocusLoss;
+  final String subSize;
+  final String subColor;
+  final String subBgColor;
   final void Function(VideoTrack) onVideoTrack;
   final void Function(AudioTrack) onAudioTrack;
   final void Function(SubtitleTrack) onSubtitleTrack;
@@ -1875,6 +3089,9 @@ class _SettingsPanel extends StatelessWidget {
   final void Function(int) onSetHlsBitrate;
   final void Function(String) onSetAspectRatio;
   final void Function(bool) onSetPauseOnFocusLoss;
+  final void Function(String) onSetSubSize;
+  final void Function(String) onSetSubColor;
+  final void Function(String) onSetSubBgColor;
   final VoidCallback onClose;
 
   const _SettingsPanel({
@@ -1882,10 +3099,13 @@ class _SettingsPanel extends StatelessWidget {
     required this.activeSubtitle, required this.currentSource, required this.activeTab,
     required this.hlsVariants, required this.activeVariantBandwidth,
     required this.aspectRatio, required this.pauseOnFocusLoss,
+    required this.subSize, required this.subColor, required this.subBgColor,
     required this.onVideoTrack, required this.onAudioTrack,
     required this.onSubtitleTrack, required this.onTabChange,
     required this.onSetHlsBitrate, required this.onSetAspectRatio,
-    required this.onSetPauseOnFocusLoss, required this.onClose,
+    required this.onSetPauseOnFocusLoss,
+    required this.onSetSubSize, required this.onSetSubColor, required this.onSetSubBgColor,
+    required this.onClose,
   });
 
   // Only show Audio tab when there are 2+ audio tracks (multi-audio content)
@@ -1913,16 +3133,13 @@ class _SettingsPanel extends StatelessWidget {
           ],
           _TabChip(label: 'Subtitles', active: activeTab == _PanelTab.subtitles,
               onTap: () => onTabChange(_PanelTab.subtitles)),
-          const SizedBox(width: 8),
-          _TabChip(label: 'Display', active: activeTab == _PanelTab.none,
-              onTap: () => onTabChange(_PanelTab.none)),
         ]),
       ),
       Expanded(child: switch(activeTab) {
         _PanelTab.quality   => _buildQuality(),
         _PanelTab.audio     => _buildAudio(),
         _PanelTab.subtitles => _buildSubtitles(),
-        _                   => _buildDisplay(),
+        _                   => const SizedBox.shrink(),
       }),
     ]);
   }
@@ -2055,35 +3272,109 @@ class _SettingsPanel extends StatelessWidget {
   Widget _buildSubtitles() {
     final subTracks = tracks.subtitle.where((t) => t != SubtitleTrack.no() && t != SubtitleTrack.auto()).toList();
 
+    List<Widget> extTiles = [];
+    if (currentSource?.subtitleUrl.isNotEmpty == true) {
+      final subUrl = currentSource!.subtitleUrl.trim();
+      if (subUrl.startsWith('[')) {
+        try {
+          final List<dynamic> list = jsonDecode(subUrl);
+          for (final item in list) {
+            final url = item['url']?.toString() ?? '';
+            final lang = item['lang']?.toString() ?? 'Unknown';
+            final code = item['code']?.toString() ?? 'en';
+            if (url.isNotEmpty) {
+              final track = SubtitleTrack.uri(url, title: lang, language: code);
+              extTiles.add(_TrackTile(
+                label: '$lang (External)',
+                sublabel: 'VTT from provider',
+                badge: 'CC',
+                isActive: activeSubtitle.id == url || activeSubtitle.title == lang,
+                onTap: () => onSubtitleTrack(track),
+              ));
+            }
+          }
+        } catch (_) {}
+      } else {
+        extTiles.add(_TrackTile(
+          label: 'English (External)', sublabel: 'VTT from provider', badge: 'CC',
+          isActive: activeSubtitle != SubtitleTrack.no() && activeSubtitle != SubtitleTrack.auto(),
+          onTap: () => onSubtitleTrack(SubtitleTrack.uri(
+            currentSource!.subtitleUrl, title: 'English', language: 'en')),
+        ));
+      }
+    }
+
     return ListView(padding: const EdgeInsets.symmetric(vertical: 8), children: [
       _SectionLabel('SUBTITLES'),
       _TrackTile(label: 'Off', sublabel: 'No subtitles',
           isActive: activeSubtitle == SubtitleTrack.no(),
           onTap: () => onSubtitleTrack(SubtitleTrack.no())),
-      if (currentSource?.subtitleUrl.isNotEmpty == true)
-        _TrackTile(
-          label: 'English (External)', sublabel: 'VTT from provider', badge: 'CC',
-          isActive: activeSubtitle != SubtitleTrack.no() && activeSubtitle != SubtitleTrack.auto(),
-          onTap: () => onSubtitleTrack(SubtitleTrack.uri(
-            currentSource!.subtitleUrl, title: 'English', language: 'en')),
-        ),
+      ...extTiles,
       ...subTracks.map((t) {
         final lang = t.language?.isNotEmpty == true ? t.language! : '';
         final title = t.title?.isNotEmpty == true ? t.title! : '';
         final label = [title, lang].where((s) => s.isNotEmpty).join(' — ');
+        // Compare by id (string) not object equality — track objects are rebuilt on each setState
+        final isActive = activeSubtitle.id != null && t.id != null
+            ? activeSubtitle.id == t.id
+            : activeSubtitle == t;
         return _TrackTile(
           label: label.isNotEmpty ? label : 'Track ${t.id}',
-          isActive: activeSubtitle == t,
+          isActive: isActive,
           onTap: () => onSubtitleTrack(t),
         );
       }),
-      if (subTracks.isEmpty && currentSource?.subtitleUrl.isEmpty != false)
+      if (subTracks.isEmpty && extTiles.isEmpty)
         Padding(
           padding: const EdgeInsets.all(16),
           child: Text('No subtitles found for this source.',
               style: GoogleFonts.inter(color: Colors.white38, fontSize: 12)),
         ),
+      const Divider(color: Colors.white10, height: 24),
+      _SectionLabel('SUBTITLE SIZE'),
+      _buildStyleRow(
+        options: {'Small': '35', 'Medium': '55', 'Large': '70', 'Extra Large': '90'},
+        currentValue: subSize,
+        onSelect: onSetSubSize,
+      ),
+      const SizedBox(height: 12),
+      _SectionLabel('SUBTITLE COLOR'),
+      _buildStyleRow(
+        options: {'White': '#FFFFFFFF', 'Yellow': '#FFFFFF00', 'Cyan': '#FF00FFFF', 'Green': '#FF00FF00'},
+        currentValue: subColor,
+        onSelect: onSetSubColor,
+      ),
+      const SizedBox(height: 12),
+      _SectionLabel('BACKGROUND BOX OPACITY'),
+      _buildStyleRow(
+        options: {'None': '#00000000', 'Low': '#40000000', 'Medium': '#80000000', 'High': '#C0000000'},
+        currentValue: subBgColor,
+        onSelect: onSetSubBgColor,
+      ),
+      const SizedBox(height: 24),
     ]);
+  }
+
+  Widget _buildStyleRow({
+    required Map<String, String> options,
+    required String currentValue,
+    required void Function(String) onSelect,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: options.entries.map((entry) {
+          final isSelected = currentValue == entry.value;
+          return _StyleChip(
+            label: entry.key,
+            isSelected: isSelected,
+            onTap: () => onSelect(entry.value),
+          );
+        }).toList(),
+      ),
+    );
   }
 
   /// Format a VideoTrack using resolution (height) when available
@@ -2460,30 +3751,13 @@ class _FetchingOverlayState extends State<_FetchingOverlay>
               ),
             ],
 
-            const SizedBox(height: 36),
+            const SizedBox(height: 40),
 
-            // Animated three-dot loader
+            // Animated three-dot loader — no text, clean
             _AnimatedDots(controller: _dotCtrl),
-
-            const SizedBox(height: 14),
-
-            // Loading step message
-            AnimatedBuilder(
-              animation: _pulse,
-              builder: (_, __) => Text(
-                widget.step,
-                style: GoogleFonts.inter(
-                  color: Colors.white.withValues(alpha: 0.45 + 0.3 * _pulse.value),
-                  fontSize: 12,
-                  fontWeight: FontWeight.w400,
-                  letterSpacing: 0.2,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    ]);
+          ]),  // closes Column children + Column
+        ),     // closes Center
+    ]);        // closes Stack
   }
 
   Widget _buildStyledTitle() {
@@ -2836,3 +4110,152 @@ class _CenterSkipBtn extends StatelessWidget {
     );
   }
 }
+
+// ─── Subtitle Style Chip ──────────────────────────────────────────────────────
+
+class _StyleChip extends StatefulWidget {
+  final String label;
+  final bool isSelected;
+  final VoidCallback onTap;
+  const _StyleChip({required this.label, required this.isSelected, required this.onTap});
+
+  @override
+  State<_StyleChip> createState() => _StyleChipState();
+}
+
+class _StyleChipState extends State<_StyleChip> {
+  bool _h = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _h = true),
+      onExit: (_) => setState(() => _h = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: widget.isSelected
+                ? AppColors.accent
+                : (_h ? AppColors.surfaceHigh : AppColors.surface),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: widget.isSelected ? AppColors.accent : AppColors.cardBorder,
+              width: 0.5,
+            ),
+          ),
+          child: Text(
+            widget.label,
+            style: GoogleFonts.inter(
+              color: widget.isSelected ? Colors.white : AppColors.secondary,
+              fontSize: 11,
+              fontWeight: widget.isSelected ? FontWeight.bold : FontWeight.normal,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── Chapters Panel ─────────────────────────────────────────────────────────
+
+class _ChaptersPanel extends StatelessWidget {
+  final List<MediaChapter> chapters;
+  final Duration position;
+  final void Function(Duration) onSelect;
+  final VoidCallback onClose;
+
+  const _ChaptersPanel({
+    required this.chapters,
+    required this.position,
+    required this.onSelect,
+    required this.onClose,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        _PanelHeader(icon: Icons.bookmarks_rounded, title: 'Chapters', onClose: onClose),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            itemCount: chapters.length,
+            itemBuilder: (context, index) {
+              final c = chapters[index];
+              final timeStr = _fmt(c.time);
+              final isCurrent = index == chapters.length - 1
+                  ? position >= c.time
+                  : (position >= c.time && position < chapters[index + 1].time);
+
+              return ListTile(
+                title: Text(
+                  c.title ?? 'Chapter ${index + 1}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    color: isCurrent ? AppColors.accent : Colors.white70,
+                    fontSize: 13,
+                    fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                  ),
+                ),
+                subtitle: Text(
+                  timeStr,
+                  style: GoogleFonts.inter(
+                    color: isCurrent ? AppColors.accent.withOpacity(0.7) : Colors.white38,
+                    fontSize: 11,
+                  ),
+                ),
+                trailing: isCurrent ? const Icon(Icons.play_arrow_rounded, color: AppColors.accent, size: 18) : null,
+                onTap: () => onSelect(c.time),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _fmt(Duration d) {
+    if (d.inHours > 0) {
+      final h = d.inHours;
+      final m = d.inMinutes % 60;
+      final s = d.inSeconds % 60;
+      return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    } else {
+      final m = d.inMinutes;
+      final s = d.inSeconds % 60;
+      return '$m:${s.toString().padLeft(2, '0')}';
+    }
+  }
+}
+
+// ─── Skip Interval Model ──────────────────────────────────────────────────────
+
+class SkipInterval {
+  final double startTime;
+  final double endTime;
+  final String type; // "op" | "ed" | "recap"
+
+  SkipInterval({
+    required this.startTime,
+    required this.endTime,
+    required this.type,
+  });
+}
+
+class MediaChapter {
+  final String? title;
+  final Duration time;
+
+  MediaChapter({
+    required this.title,
+    required this.time,
+  });
+}
+
+

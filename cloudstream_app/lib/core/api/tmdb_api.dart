@@ -2,6 +2,7 @@
 
 import 'package:dio/dio.dart';
 import '../models/tmdb_models.dart';
+import 'dns_over_https.dart';
 
 class TmdbApi {
   static const String _baseUrl = 'https://api.themoviedb.org/3';
@@ -11,15 +12,16 @@ class TmdbApi {
   TmdbApi._();
   static final instance = TmdbApi._();
 
-  final Dio _dio = Dio(BaseOptions(
+  // Uses DNS-over-HTTPS so api.themoviedb.org resolves correctly on Jio
+  late final Dio _dio = DnsOverHttps.createDio(
     baseUrl: _baseUrl,
     headers: {
       'Authorization': 'Bearer $_accessToken',
       'accept': 'application/json',
     },
-    connectTimeout: const Duration(seconds: 10),
-    receiveTimeout: const Duration(seconds: 15),
-  ));
+    connectTimeout: const Duration(seconds: 12),
+    receiveTimeout: const Duration(seconds: 20),
+  );
 
   Future<List<TmdbItem>> getTrendingMovies() async {
     final r = await _dio.get('/trending/movie/day?language=en-US');
@@ -98,12 +100,14 @@ class TmdbApi {
   }
 
   Future<TmdbDetail> getDetails(int id, String mediaType) async {
-    final r = await _dio.get('/$mediaType/$id?language=en-US&append_to_response=images&include_image_language=en,null');
+    final r = await _dio.get(
+        '/$mediaType/$id?language=en-US&append_to_response=images&include_image_language=en,null');
     if (r.statusCode == 200) return TmdbDetail.fromJson(r.data, mediaType);
     throw Exception('Failed to load TMDB details');
   }
 
-  Future<List<TmdbEpisode>> getSeasonEpisodes(int seriesId, int seasonNumber) async {
+  Future<List<TmdbEpisode>> getSeasonEpisodes(
+      int seriesId, int seasonNumber) async {
     final r = await _dio.get('/tv/$seriesId/season/$seasonNumber?language=en-US');
     if (r.statusCode == 200) {
       final episodes = r.data['episodes'] as List;

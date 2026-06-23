@@ -76,6 +76,7 @@ class BookmarkItem {
   final String mediaType;
   final String overview;
   final DateTime addedAt;
+  final String category;
 
   BookmarkItem({
     required this.tmdbId,
@@ -84,6 +85,7 @@ class BookmarkItem {
     required this.mediaType,
     required this.overview,
     required this.addedAt,
+    this.category = 'Plan to Watch',
   });
 
   Map<String, dynamic> toJson() => {
@@ -93,6 +95,7 @@ class BookmarkItem {
         'mediaType': mediaType,
         'overview': overview,
         'addedAt': addedAt.toIso8601String(),
+        'category': category,
       };
 
   factory BookmarkItem.fromJson(Map<String, dynamic> j) => BookmarkItem(
@@ -102,6 +105,7 @@ class BookmarkItem {
         mediaType: j['mediaType'] ?? 'movie',
         overview: j['overview'] ?? '',
         addedAt: DateTime.tryParse(j['addedAt'] ?? '') ?? DateTime.now(),
+        category: j['category'] ?? 'Plan to Watch',
       );
 }
 
@@ -277,6 +281,25 @@ class LocalDb {
     await prefs.setString(_bookmarksKey, jsonEncode(list.map((e) => e.toJson()).toList()));
   }
 
+  Future<void> updateBookmarkCategory(int tmdbId, String category) async {
+    final list = await getBookmarks();
+    final idx = list.indexWhere((b) => b.tmdbId == tmdbId);
+    if (idx >= 0) {
+      final old = list[idx];
+      list[idx] = BookmarkItem(
+        tmdbId: old.tmdbId,
+        title: old.title,
+        posterUrl: old.posterUrl,
+        mediaType: old.mediaType,
+        overview: old.overview,
+        addedAt: old.addedAt,
+        category: category,
+      );
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_bookmarksKey, jsonEncode(list.map((e) => e.toJson()).toList()));
+    }
+  }
+
   Future<void> clearBookmarks() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_bookmarksKey);
@@ -312,5 +335,39 @@ class LocalDb {
         d.episodeNumber == item.episodeNumber);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_downloadsKey, jsonEncode(list.map((e) => e.toJson()).toList()));
+  }
+
+  // ── Search History ─────────────────────────────────────────────────────────
+
+  static const _searchHistoryKey = 'search_history_v2';
+
+  Future<List<String>> getSearchHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getStringList(_searchHistoryKey) ?? [];
+  }
+
+  Future<void> saveSearchQuery(String query) async {
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) return;
+    final list = await getSearchHistory();
+    list.removeWhere((q) => q.toLowerCase() == trimmed.toLowerCase());
+    list.insert(0, trimmed);
+    if (list.length > 10) {
+      list.removeRange(10, list.length);
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_searchHistoryKey, list);
+  }
+
+  Future<void> removeSearchQuery(String query) async {
+    final list = await getSearchHistory();
+    list.removeWhere((q) => q.toLowerCase() == query.toLowerCase());
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_searchHistoryKey, list);
+  }
+
+  Future<void> clearSearchHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_searchHistoryKey);
   }
 }
