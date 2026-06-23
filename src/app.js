@@ -31,6 +31,17 @@ app.use("/api/settings", settingsRoute);
 // Health check
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Debug HTML fetch
+import { fetchHTML } from "./providers/common.js";
+app.get("/debug/fetch", async (req, res) => {
+  try {
+    const html = await fetchHTML(req.query.url);
+    res.send(html);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
 // ---------- AUTO‑UPDATE ENDPOINTS ----------
 // Check for provider updates
 app.get("/api/updates/check", async (req, res) => {
