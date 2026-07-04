@@ -1,8 +1,0 @@
-﻿{
-  "common": "1.0.0",
-  "providers": {
-    "anidao": "1.0.1",
-    "fourkhdhub": "1.0.0",
-    "hdmoviesplus": "1.0.0"
-  }
-}
