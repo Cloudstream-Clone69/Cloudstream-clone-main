@@ -1,5 +1,5 @@
 {
-  "maintenance": false,
+  "maintenance": true,
   "maintenance_message": "We are currently performing server updates. Please check back later.",
   "latest_version": "1.0.1",
   "mandatory": true,
