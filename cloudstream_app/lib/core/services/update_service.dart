@@ -2,6 +2,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:convert';
 import '../constants.dart';
 
 class UpdateInfo {
@@ -59,9 +60,13 @@ class UpdateService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      final dio = Dio();
+      final dio = Dio(BaseOptions(
+        connectTimeout: const Duration(seconds: 4),
+        receiveTimeout: const Duration(seconds: 4),
+      ));
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
       final res = await dio.get(
-        kUpdateConfigUrl,
+        '$kUpdateConfigUrl?t=$timestamp',
         options: Options(
           headers: {
             'Cache-Control': 'no-cache',
@@ -73,8 +78,13 @@ class UpdateService extends ChangeNotifier {
       if (res.statusCode == 200 && res.data != null) {
         dynamic data = res.data;
         if (data is String) {
-          // If GitHub Pages returned a raw string, decode it
-          importJsonString(data);
+          try {
+            final Map<String, dynamic> parsed = Map<String, dynamic>.from(jsonDecode(data));
+            _info = UpdateInfo.fromJson(parsed);
+          } catch (_) {
+            // Fallback to custom decode if it's not standard JSON
+            importJsonString(data);
+          }
         } else if (data is Map<String, dynamic>) {
           _info = UpdateInfo.fromJson(data);
         }

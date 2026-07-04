@@ -3,7 +3,7 @@
 
 [Setup]
 AppName=CloudStream
-AppVersion=1.0.0
+AppVersion=1.0.1
 DefaultDirName={autopf}\CloudStream
 DefaultGroupName=CloudStream
 OutputDir=ReleaseInstaller

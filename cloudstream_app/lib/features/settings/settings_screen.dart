@@ -561,32 +561,7 @@ class _DnsSectionState extends State<_DnsSection> {
           ),
         ),
 
-        const SizedBox(height: 32),
-
-        // ── Backend URL ──
-        _GroupLabel('Backend Server'),
-        _Card(children: [
-          _InfoTile(
-            icon: Icons.computer_rounded,
-            iconColor: Colors.blue,
-            label: 'Backend URL',
-            value: s.backendUrl,
-            subtitle: 'Address of the local streaming backend',
-            onTap: () => _editBackendUrl(context, s),
-          ),
-        ]),
-
-        const SizedBox(height: 4),
-        Padding(
-          padding: const EdgeInsets.only(left: 4),
-          child: Text(
-            '💡 The DNS setting applies to the backend server (which makes external requests). Restart the backend after changing DNS if streams don\'t load.',
-            style: GoogleFonts.inter(
-                color: AppColors.tertiary, fontSize: 11, height: 1.5),
-          ),
-        ),
-
-        const SizedBox(height: 28),
+        const SizedBox(height: 8),
 
         // ── DoH Status Banner ──
         Container(
@@ -692,6 +667,9 @@ class _DnsSectionState extends State<_DnsSection> {
             ]),
           ),
         ]),
+
+
+
       ]);
     });
   }
@@ -731,6 +709,8 @@ class _DnsSectionState extends State<_DnsSection> {
     );
   }
 }
+
+
 
 class _DnsStatusBanner extends StatelessWidget {
   final bool success;
@@ -1005,6 +985,40 @@ class _PlaybackSection extends StatelessWidget {
         ]),
 
         const SizedBox(height: 20),
+        _GroupLabel('Default Subtitle Language'),
+        _Card(children: [
+          _ChoiceTile(
+            icon: Icons.subtitles_rounded,
+            iconColor: Colors.blueAccent,
+            label: 'English',
+            subtitle: 'Auto-select English subtitles if available',
+            selected: s.preferredSubtitleLang == 'English',
+            onTap: () => s.setPreferredSubtitleLang('English'),
+          ),
+          _ChoiceTile(
+            icon: Icons.subtitles_off_rounded,
+            iconColor: Colors.grey,
+            label: 'Off',
+            subtitle: 'Disable subtitles by default',
+            selected: s.preferredSubtitleLang == 'Off',
+            onTap: () => s.setPreferredSubtitleLang('Off'),
+          ),
+        ]),
+
+        const SizedBox(height: 20),
+        _GroupLabel('Network Optimizations'),
+        _Card(children: [
+          _ToggleTile(
+            icon: Icons.speed_rounded,
+            iconColor: Colors.deepOrangeAccent,
+            label: 'Optimize for Slow Connections',
+            subtitle: 'Increase search timeouts and default HLS bitrate to lowest to avoid stuttering.',
+            value: s.slowConnectionMode,
+            onChanged: s.setSlowConnectionMode,
+          ),
+        ]),
+
+        const SizedBox(height: 20),
         _GroupLabel('Behavior'),
         _Card(children: [
           _ToggleTile(
@@ -1116,13 +1130,13 @@ class _ProvidersSection extends StatelessWidget {
         _GroupLabel('Movies & TV Shows'),
         _Card(children: [
           _ProviderTile(
-            name: '4KHD Hub',
-            description: 'High-quality 1080p/4K movies and TV shows',
-            badgeText: '1080p · 4K',
-            badgeColor: const Color(0xFF69F0AE),
-            enabled: s.enable4kHdHub,
-            onChanged: s.setEnable4kHdHub,
-            icon: Icons.movie_filter_rounded,
+            name: 'CineStream',
+            description: 'Multi-source embed aggregator (Vidlink)',
+            badgeText: 'Multi-Source · HLS',
+            badgeColor: const Color(0xFFE50914),
+            enabled: s.enableCineStream,
+            onChanged: s.setEnableCineStream,
+            icon: Icons.stream_rounded,
           ),
         ]),
 
@@ -1130,13 +1144,13 @@ class _ProvidersSection extends StatelessWidget {
         _GroupLabel('Anime'),
         _Card(children: [
           _ProviderTile(
-            name: 'AniDB',
-            description: 'Anime streaming with Sub/Dub options',
-            badgeText: 'Sub · Dub',
-            badgeColor: Colors.amber,
-            enabled: s.enableAniDb,
-            onChanged: s.setEnableAniDb,
-            icon: Icons.play_circle_filled_rounded,
+            name: 'AnimeSalt',
+            description: 'Multi-Audio anime & movie streams',
+            badgeText: 'Multi-Audio',
+            badgeColor: Colors.blueAccent,
+            enabled: s.enableAnimeSalt,
+            onChanged: s.setEnableAnimeSalt,
+            icon: Icons.movie_rounded,
           ),
         ]),
 
@@ -1179,6 +1193,8 @@ class _ProvidersSection extends StatelessWidget {
             )),
           ]),
         ),
+
+
       ]);
     });
   }
@@ -1187,8 +1203,8 @@ class _ProvidersSection extends StatelessWidget {
 
 // Provider display metadata
 const _kProviderMeta = <String, ({String name, IconData icon, Color color})>{
-  '4khdhub':  (name: '4KHD Hub',  icon: Icons.movie_filter_rounded,        color: Color(0xFF69F0AE)),
-  'anidb':    (name: 'AniDB',     icon: Icons.play_circle_filled_rounded,   color: Colors.amber),
+  'cinestream': (name: 'CineStream', icon: Icons.stream_rounded,            color: Color(0xFFE50914)),
+  'animesalt': (name: 'AnimeSalt', icon: Icons.movie_rounded,              color: Colors.blueAccent),
 };
 
 class _PriorityReorder extends StatefulWidget {
@@ -1738,12 +1754,6 @@ class _AboutSectionState extends State<_AboutSection> {
             value: 'Flutter 3.x + Media Kit',
           ),
           _InfoTile(
-            icon: Icons.storage_rounded,
-            iconColor: Colors.purple,
-            label: 'Backend',
-            value: 'Node.js + Express',
-          ),
-          _InfoTile(
             icon: Icons.movie_rounded,
             iconColor: const Color(0xFF69F0AE),
             label: 'Metadata',
@@ -2059,6 +2069,102 @@ class _DropdownTile<T> extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _CookieInputTile extends StatefulWidget {
+  final String title;
+  final String value;
+  final ValueChanged<String> onChanged;
+  final String hint;
+
+  const _CookieInputTile({
+    required this.title,
+    required this.value,
+    required this.onChanged,
+    required this.hint,
+  });
+
+  @override
+  State<_CookieInputTile> createState() => _CookieInputTileState();
+}
+
+class _CookieInputTileState extends State<_CookieInputTile> {
+  late TextEditingController _ctrl;
+  bool _editing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = TextEditingController(text: widget.value);
+  }
+
+  @override
+  void didUpdateWidget(_CookieInputTile old) {
+    super.didUpdateWidget(old);
+    if (old.value != widget.value) {
+      _ctrl.text = widget.value;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(widget.title, style: GoogleFonts.inter(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+            TextButton(
+              onPressed: () {
+                setState(() {
+                  _editing = !_editing;
+                  if (!_editing) {
+                    widget.onChanged(_ctrl.text);
+                  }
+                });
+              },
+              child: Text(
+                _editing ? 'Save' : (_ctrl.text.isEmpty ? 'Setup' : 'Edit'),
+                style: GoogleFonts.inter(color: AppColors.accent, fontSize: 13, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        if (_editing)
+          Padding(
+            padding: const EdgeInsets.only(top: 4, bottom: 8),
+            child: TextField(
+              controller: _ctrl,
+              maxLines: null,
+              style: GoogleFonts.inter(color: Colors.white, fontSize: 12),
+              decoration: InputDecoration(
+                hintText: widget.hint,
+                hintStyle: GoogleFonts.inter(color: Colors.white24, fontSize: 11),
+                contentPadding: const EdgeInsets.all(12),
+                filled: true,
+                fillColor: AppColors.surfaceHigher,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+              ),
+            ),
+          )
+        else
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Text(
+              _ctrl.text.isEmpty ? 'Not configured' : 'Configured (starts with: ${_ctrl.text.substring(0, _ctrl.text.length > 25 ? 25 : _ctrl.text.length)}...)',
+              style: GoogleFonts.inter(color: _ctrl.text.isEmpty ? Colors.white38 : Colors.greenAccent, fontSize: 12),
+            ),
+          ),
+      ],
     );
   }
 }
