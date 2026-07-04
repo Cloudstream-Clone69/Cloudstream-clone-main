@@ -1,6 +1,7 @@
 // lib/main.dart
 
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:go_router/go_router.dart';
@@ -11,9 +12,11 @@ import 'dart:ui';
 import 'shared/theme/app_theme.dart';
 import 'shared/widgets/sidebar.dart';
 
+import 'core/constants.dart';
 import 'features/splash/splash_screen.dart';
 import 'features/home/home_screen.dart';
 import 'features/home/home_provider.dart';
+import 'features/sports/sports_screen.dart';
 import 'features/search/search_screen.dart';
 import 'features/search/search_provider.dart';
 import 'features/detail/detail_screen.dart';
@@ -109,6 +112,10 @@ final _router = GoRouter(
           pageBuilder: (ctx, state) => _noTransitionPage(state, const HomeScreen()),
         ),
         GoRoute(
+          path: '/sports',
+          pageBuilder: (ctx, state) => _noTransitionPage(state, const SportsScreen()),
+        ),
+        GoRoute(
           path: '/search',
           pageBuilder: (ctx, state) => _noTransitionPage(state, const SearchScreen()),
         ),
@@ -155,9 +162,19 @@ final _router = GoRouter(
       path: '/player',
       pageBuilder: (ctx, state) {
         final extra = state.extra as Map<String, dynamic>;
+        // Build a stable key that changes whenever the target episode changes.
+        // This forces GoRouter to dispose the old PlayerScreen and create a fresh
+        // one when the user navigates from one episode to another while already
+        // on the /player route (pushReplacement would otherwise reuse state).
+        final navId    = extra['_navId']?.toString() ?? '';
+        final season   = extra['seasonNumber']?.toString() ?? '';
+        final episode  = extra['episodeNumber']?.toString() ?? '';
+        final tmdb     = extra['tmdbId']?.toString() ?? '';
+        final uniqueKey = ValueKey('player_${tmdb}_S${season}E${episode}_$navId');
         return _slideUpPage(
           state,
           PlayerScreen(
+            key: uniqueKey,
             tmdbId:        extra['tmdbId']        as String? ?? '',
             mediaType:     extra['mediaType']     as String? ?? '',
             title:         extra['title']         as String? ?? '',
@@ -172,10 +189,13 @@ final _router = GoRouter(
             logoUrl:       extra['logo']          as String?,
             episodeUrl:    extra['episodeUrl']    as String?,
             showUrl:       extra['showUrl']       as String?,
+            preloadedRefs: extra['preloadedRefs'] as List<Map<String, dynamic>>?,
+            preloadedEpisodes: extra['preloadedEpisodes'] as List<Map<String, dynamic>>?,
           ),
         );
       },
     ),
+
   ],
 );
 
@@ -215,8 +235,52 @@ class AppScrollBehavior extends MaterialScrollBehavior {
       };
 }
 
-class CloudStreamApp extends StatelessWidget {
+class CloudStreamApp extends StatefulWidget {
   const CloudStreamApp({super.key});
+
+  @override
+  State<CloudStreamApp> createState() => _CloudStreamAppState();
+}
+
+class _CloudStreamAppState extends State<CloudStreamApp> {
+  Timer? _updateTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    // Periodically check for updates/maintenance every 5 minutes in the background
+    _updateTimer = Timer.periodic(const Duration(minutes: 5), (_) => _checkStatus());
+  }
+
+  @override
+  void dispose() {
+    _updateTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _checkStatus() async {
+    try {
+      final info = await UpdateService.instance.checkUpdate();
+      if (info != null) {
+        // 1. Instantly block if maintenance mode is enabled
+        if (info.maintenance) {
+          _router.go('/maintenance', extra: info.maintenanceMessage);
+          return;
+        }
+
+        // 2. Instantly force update if a mandatory update is available
+        final updateAvailable = UpdateService.instance.isUpdateAvailable(kAppVersion, info.latestVersion);
+        if (updateAvailable && info.mandatory) {
+          _router.go('/update', extra: {
+            'info': info,
+            'mandatory': true,
+          });
+        }
+      }
+    } catch (e) {
+      print('[UpdateTimer] Periodic status check error: $e');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
