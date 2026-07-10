@@ -1,8 +1,8 @@
 {
   "maintenance": false,
   "maintenance_message": "We are currently performing server updates. Please check back later.",
-  "latest_version": "2.0.3",
+  "latest_version": "3.0.0",
   "mandatory": true,
-  "download_url": "https://github.com/Cloudstream-Clone69/Cloudstream-clone-main/releases/download/v2.0.3/playit_setup.exe",
+  "download_url": "https://github.com/Cloudstream-Clone69/Cloudstream-clone-main/releases/download/v3.0.0/playit_setup.exe",
   "release_notes": "Bug fixeds, performance improvements, and new feature updates!"
 }
