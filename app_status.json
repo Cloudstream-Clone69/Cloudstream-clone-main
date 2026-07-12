@@ -3,6 +3,31 @@
   "maintenance_message": "We are currently performing server updates. Please check back later.",
   "latest_version": "3.0.2",
   "mandatory": true,
-  "download_url": "https://github.com/Cloudstream-Clone69/Cloudstream-clone-main/releases/download/v3.0.2/playit_setup.exe",
-  "release_notes": "Bug fixeds, performance improvements, and new feature updates!"
+  "download_url": "https://github.com/Cloudstream-Clone69/Cloudstream-clone-main/releases/download/V3.0.2/playit_setup.exe",
+  "release_notes": "Bug fixeds, performance improvements, and new feature updates!",
+
+  "netmirror": {
+    "enabled": true,
+    "base_url": "https://net52.cc",
+    "bypass": {
+      "url": "https://net52.cc/verify.php",
+      "origin": "https://net22.cc",
+      "referer": "https://net22.cc/verify2",
+      "cookie_name": "t_hash_t"
+    },
+    "ua_webview": "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.91 Safari/537.36 /OS.Gatu v3.0",
+    "ua_desktop": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "x_requested_with": "app.netmirror.netmirrornew",
+    "referer_home": "https://net52.cc/mobile/home?app=1",
+    "referer_browse": "https://net52.cc/home",
+    "ott": {
+      "nf": { "search": "/mobile/search.php",    "playlist": "/mobile/playlist.php"    },
+      "hs": { "search": "/mobile/hs/search.php", "playlist": "/mobile/hs/playlist.php" },
+      "pv": { "search": "/mobile/pv/search.php", "playlist": "/mobile/pv/playlist.php" }
+    },
+    "m_token": "3d375ad75a678dcdcbe62e415b0d4a9b::2adb124936a38f4054cf7d0343ddac5c::1783879993::ni::m"
+  }
 }
+
+
+
