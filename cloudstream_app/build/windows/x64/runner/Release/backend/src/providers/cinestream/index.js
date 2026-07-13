@@ -409,11 +409,10 @@ async function load(url, options = {}) {
             if (isMovieMatch || isSeriesMatch) {
               const qBadge = (ep.quality || 'Unknown').toLowerCase().trim();
               
-              // Only allow 4K (2160) and 1080p from 4KHDHub (A)
+              // Only allow 4K (2160) from 4KHDHub (A)
               const is4k = /4k|2160/i.test(qBadge);
-              const is1080p = /1080/i.test(qBadge);
-              if (!is4k && !is1080p) {
-                return; // SKIP 720p, 480p, etc. from 4KHDHub (A)
+              if (!is4k) {
+                return; // SKIP 1080p, 720p, 480p, etc. from 4KHDHub (A)
               }
 
               const sizeInMb = parseSizeToMb(ep.size);
