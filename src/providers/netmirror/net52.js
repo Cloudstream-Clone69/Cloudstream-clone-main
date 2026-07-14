@@ -225,6 +225,11 @@ async function doVerifyBypass() {
  *  4. Fresh verify.php bypass (POST) — ::99 tier, works for PrimeVideo only
  */
 export async function getToken(ott = 'pv') {
+  // HARDCODED TESTING TOKEN
+  const hardcodedToken = "bf2c4babb289db772aa739bdb73ca403::c7329f6d4f7bb7e64696396c603f19bc::1784006908::ni::m";
+  console.log('[Net52] USING HARDCODED TESTING TOKEN: ' + hardcodedToken);
+  return hardcodedToken;
+
   // Priority 1: ::m premium token from remote GitHub config
   // This is the CNCVerse shared credential — works for Netflix, Hotstar, PrimeVideo
   await getRemoteConfig(); // ensure config is loaded (cached, no perf hit after first call)
@@ -467,3 +472,29 @@ export const search = async (query, ott) => {
     poster: 'https://imgcdn.kim/' + (ott === 'nf' ? 'poster' : ott) + '/v/' + r.id + '.jpg',
   }));
 };
+
+// ── SESSION INJECTION & RESET (for app.js integration) ─────────────────────────
+export async function injectToken(token) {
+  try {
+    const decoded = decodeURIComponent(token);
+    tokenCache.token = decoded;
+    tokenCache.expiresAt = Date.now() + SESSION_TTL_MS;
+    storeToken(decoded);
+    console.log('[Net52] Manually injected token:', decoded.substring(0, 40) + '...');
+    return { ok: true, message: 'Token injected successfully', token: decoded };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function resetSession() {
+  try {
+    tokenCache.token = null;
+    tokenCache.expiresAt = 0;
+    const token = await getToken();
+    return { ok: true, source: 'verify.php', token };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
