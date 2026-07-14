@@ -225,46 +225,47 @@ async function doVerifyBypass() {
  *  4. Fresh verify.php bypass (POST) — ::99 tier, works for PrimeVideo only
  */
 export async function getToken(ott = 'pv') {
-  // HARDCODED TESTING TOKEN
-  const hardcodedToken = "bf2c4babb289db772aa739bdb73ca403::c7329f6d4f7bb7e64696396c603f19bc::1784006908::ni::m";
-  console.log('[Net52] USING HARDCODED TESTING TOKEN: ' + hardcodedToken);
-  return hardcodedToken;
-
-  // Priority 1: ::m premium token from remote GitHub config
-  // This is the CNCVerse shared credential — works for Netflix, Hotstar, PrimeVideo
-  await getRemoteConfig(); // ensure config is loaded (cached, no perf hit after first call)
-  const mToken = cfg.mToken;
-  if (mToken && mToken.includes('::m')) {
-    console.log('[Net52] Using ::m premium token from app_status.json ✅');
-    // Cache it so we don't re-read config every call
-    if (!tokenCache.token || !tokenCache.token.includes('::m')) {
-      tokenCache.token = mToken;
-      tokenCache.expiresAt = Date.now() + SESSION_TTL_MS;
-    }
-    return mToken;
-  }
-
-  // Priority 2: Universal in-memory cache
+  // Priority 1: Universal in-memory cache (fastest)
   if (tokenCache.token && Date.now() < tokenCache.expiresAt) {
     return tokenCache.token;
   }
 
-  // Priority 3: Stored token from app-settings.json
+  // Priority 2: Stored / Manually Injected token from app-settings.json
+  // This ensures the local Token Injector web page (Option 1) works instantly!
   const stored = readStoredToken();
   if (stored) {
     const parts = stored.split('::');
     const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
     const age = Date.now() - ts;
     if (age < SESSION_TTL_MS) {
-      console.log('[Net52] Using stored token (age: ' + Math.round(age / 3600000) + 'h)');
+      console.log('[Net52] Using fresh injected/stored token (age: ' + Math.round(age / 3600000) + 'h)');
       tokenCache.token = stored;
       tokenCache.expiresAt = ts + SESSION_TTL_MS;
       return stored;
     }
-    console.log('[Net52] Stored token expired, refreshing via verify.php...');
+    console.log('[Net52] Stored token expired, checking other options...');
   }
 
-  // Priority 4: Fresh verify.php bypass (::99, works for PrimeVideo only)
+  // Priority 3: ::m premium token from remote GitHub config (community fallback)
+  try {
+    await getRemoteConfig(); // ensure config is loaded
+    const mToken = cfg.mToken;
+    if (mToken && mToken.includes('::m')) {
+      const parts = mToken.split('::');
+      const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
+      const age = Date.now() - ts;
+      if (age < SESSION_TTL_MS) {
+        console.log('[Net52] Using ::m premium token from GitHub config ✅');
+        tokenCache.token = mToken;
+        tokenCache.expiresAt = ts + SESSION_TTL_MS;
+        return mToken;
+      }
+    }
+  } catch (err) {
+    console.warn('[Net52] Remote config check failed:', err.message);
+  }
+
+  // Priority 4: Fresh verify.php bypass (::99 tier fallback)
   if (bypassInProgress) {
     console.log('[Net52] Bypass already in progress, waiting...');
     return bypassInProgress;
