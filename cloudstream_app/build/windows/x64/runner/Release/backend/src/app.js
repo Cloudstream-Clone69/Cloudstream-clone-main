@@ -19,7 +19,7 @@ import historyRoute from "./routes/history.js";
 import { checkForUpdates, downloadAndUpdate } from "../src/updater.js";   // adjust path if needed
 import { dnsAxios as sfAxios } from "./services/dnsAxios.js";
 import { fetchHTML } from "./providers/common.js";
-import { resetSession } from "./providers/netmirror/net52.js";
+import { resetSession, getToken } from "./providers/netmirror/net52.js";
 
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -46,7 +46,30 @@ async function getAppStatus(ax) {
   }
 }
 
+globalThis.APP_URL = process.env.APP_URL || 'http://127.0.0.1:3000';
+
 const app = express();
+
+app.set('trust proxy', true);
+
+// Strips mount path prefix /playit if request starts with it (for cPanel subfolder mount)
+app.use((req, res, next) => {
+  if (req.url.startsWith('/playit')) {
+    req.url = req.url.substring(7) || '/';
+  }
+  next();
+});
+
+// Middleware to dynamically discover host if not explicitly configured in environment
+app.use((req, res, next) => {
+  if (!process.env.APP_URL && (globalThis.APP_URL === 'http://127.0.0.1:3000' || !globalThis.APP_URL)) {
+    const host = req.get('host');
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const pathPrefix = req.originalUrl.startsWith('/playit') ? '/playit' : '';
+    globalThis.APP_URL = `${protocol}://${host}${pathPrefix}`;
+  }
+  next();
+});
 
 // Explicitly allow all origins including file:// (null origin)
 app.use(cors({
@@ -64,21 +87,28 @@ app.get("/player", (req, res) => {
   res.setHeader('Pragma', 'no-cache');
 
   const paths = [
+    join(process.cwd(), 'index.html'),
     'C:\\Users\\ayu12\\Desktop\\playit-demo\\index.html',
     join(process.cwd(), '..', '..', '..', '..', 'playit-demo', 'index.html'),
   ];
   for (const p of paths) {
     if (existsSync(p)) {
       let html = readFileSync(p, 'utf8');
-      // Patch API constant to use relative path (same origin)
+      
+      let apiPrefix = '';
+      if (req.originalUrl.startsWith('/playit')) {
+        apiPrefix = '/playit';
+      }
+      
+      // Patch API constant to use correct relative path (same origin or subfolder mount)
       html = html.replace(
         /const API\s*=\s*['"]http:\/\/127\.0\.0\.1:3000['"]/,
-        "const API = ''"  // relative — same server
+        `const API = '${apiPrefix}'`
       );
       return res.type('html').send(html);
     }
   }
-  res.status(404).send('Player not found at C:\\Users\\ayu12\\Desktop\\playit-demo\\index.html');
+  res.status(404).send('Player index.html not found in application root or ' + paths.slice(1).join(', '));
 });
 
 // Existing routes
@@ -110,11 +140,10 @@ app.get("/api/player/search", async (req, res) => {
   const UA  = "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/149.0.7827.91 Safari/537.36 /OS.Gatu v3.0";
   const ts  = Math.floor(Date.now() / 1000);
 
-  // 1. Get m_token
+  // 1. Get m_token using our unified getToken priority system
   let M_TOKEN = "";
   try {
-    const cfg = await ax.get("https://raw.githubusercontent.com/Cloudstream-Clone69/Cloudstream-clone-main/main/app_status.json", { timeout: 5000 });
-    M_TOKEN = cfg.data?.netmirror?.m_token || "";
+    M_TOKEN = await getToken();
   } catch (_) {}
 
   // 2. TMDB search
@@ -186,19 +215,10 @@ app.get("/api/player/resolve", async (req, res) => {
 
   let M_TOKEN = "";
   try {
-    const cfg = await ax.get("https://raw.githubusercontent.com/Cloudstream-Clone69/Cloudstream-clone-main/main/app_status.json", { timeout: 5000 });
-    M_TOKEN = cfg.data?.netmirror?.m_token || "";
-  } catch (_) {}
-  // Fallback: use local getToken() (verify.php bypass — self-renewing, no GitHub needed)
-  if (!M_TOKEN) {
-    try {
-      const { getToken } = await import('./providers/netmirror/net52.js');
-      M_TOKEN = await getToken();
-      console.log('[PlayerResolve] Using local verify.php token (GitHub m_token unavailable)');
-    } catch (e) {
-      console.error('[PlayerResolve] Local token also failed:', e.message);
-      return res.status(503).json({ error: "Token unavailable — try /api/netmirror/reset" });
-    }
+    M_TOKEN = await getToken(preferOtt || 'pv');
+  } catch (e) {
+    console.error('[PlayerResolve] getToken failed:', e.message);
+    return res.status(503).json({ error: "Token unavailable — try /api/netmirror/reset" });
   }
   if (!M_TOKEN) return res.status(503).json({ error: "Token unavailable" });
 
@@ -303,7 +323,7 @@ app.get("/api/player/resolve", async (req, res) => {
         }
         return {
           label: s.label || 'Auto',
-          proxy: `http://127.0.0.1:3000/proxy/hls?url=${encodeURIComponent('https://net52.cc'+file)}&ref=${refEnc}&cookie=${hlsCookie}&ott=${ott}&ua=${uaEnc}`,
+          proxy: `${globalThis.APP_URL}/proxy/hls?url=${encodeURIComponent('https://net52.cc'+file)}&ref=${refEnc}&cookie=${hlsCookie}&ott=${ott}&ua=${uaEnc}`,
         };
       });
       const subtitles = (raw.tracks || []).map(t => ({ label: t.label || t.lang, url: 'https:' + (t.file || t.url || '') }));
@@ -340,18 +360,12 @@ app.get("/api/player", async (req, res) => {
   ]);
   console.log(`[Player] Step1+2 (token+TMDB) done in ${Date.now()-t0}ms`);
 
-  const M_TOKEN_GITHUB = appStatus?.netmirror?.m_token || '';
-  // Fallback: use local getToken() from net52.js (verify.php bypass)
-  let M_TOKEN = M_TOKEN_GITHUB;
-  if (!M_TOKEN) {
-    try {
-      const { getToken } = await import('./providers/netmirror/net52.js');
-      M_TOKEN = await getToken();
-      console.log('[Player] Using local verify.php token (GitHub m_token unavailable)');
-    } catch (e) {
-      console.error('[Player] Local token also failed:', e.message);
-      return res.status(503).json({ error: 'Token unavailable — try /api/netmirror/reset to refresh' });
-    }
+  let M_TOKEN = "";
+  try {
+    M_TOKEN = await getToken(ott);
+  } catch (e) {
+    console.error('[Player] getToken failed:', e.message);
+    return res.status(503).json({ error: 'Token unavailable — try /api/netmirror/reset to refresh' });
   }
   if (!M_TOKEN) return res.status(503).json({ error: 'Token unavailable' });
 
@@ -397,30 +411,96 @@ app.get("/api/player", async (req, res) => {
   if (!contentId) return res.json({ error: "Content not found on NetMirror", searchResults, title, year });
 
   // ── 4. For TV: list episodes, find episode ID ────────────────────────────
+  // Cloudstream uses net52's native flow: post.php → episodes.php (with season IDs)
+  // NOT tv.imgcdn.kim (which returns empty for most content)
   let episodes = [], episodeId = contentId;
   if (type === "tv") {
+    const t4 = Date.now();
+    let foundEp = false;
+
+    // --- Primary: net52 native post.php → episodes.php (Cloudstream's actual method) ---
     try {
-      const t4 = Date.now();
-      const tvHdrs = { "X-Requested-With": "NetmirrorNewTV v1.0", "User-Agent": "Mozilla/5.0 /OS.GatuNewTV v1.0", "ott": ott };
-      const epRes = await ax.get(`https://tv.imgcdn.kim/${o.episodes}?id=${contentId}&page=1`, { headers: tvHdrs, timeout: 10000 });
-      episodes = epRes.data?.episodes || [];
-      const ep = episodes.find(e => String(e.ep) === String(episode));
-      if (ep) episodeId = ep.id;
-      console.log(`[Player] Step4 (episodes) done in ${Date.now()-t4}ms — ${episodes.length} eps`);
-    } catch (e) { console.warn(`[Player] Step4 episodes failed: ${e.message}`); }
-    // Fallback: all episodes pages
-    if (episodes.length === 0) {
+      const postRes = await ax.get(`https://net52.cc/mobile/post.php?id=${contentId}&t=${ts}`, { headers: hdrs, timeout: 8000 });
+      const postData = postRes.data || {};
+      // post.php returns seasons array like [{id, title, episodes:[{id, ep, ...}]}]
+      // OR a flat episodes array. Handle both.
+      const seasons = postData.seasons || postData.series || [];
+      const flatEpisodes = postData.episodes || [];
+
+      if (seasons.length > 0) {
+        // Multi-season: find the right season by number, then the episode within it
+        const targetSeason = parseInt(season, 10) || 1;
+        // Try to match season by index or by season number field
+        const seasonObj = seasons.find(s => s.season === targetSeason || s.s === targetSeason)
+                       || seasons[targetSeason - 1]
+                       || seasons[0];
+        const seasonEps = seasonObj?.episodes || [];
+        // Build flat list from season episodes
+        seasonEps.forEach(e => episodes.push(e));
+
+        // If no episodes directly in season, fetch via episodes.php using season's id
+        if (!seasonEps.length && seasonObj?.id) {
+          for (let p = 1; p <= 10; p++) {
+            try {
+              const er = await ax.get(`https://net52.cc/mobile/episodes.php?s=${seasonObj.id}&series=${encodeURIComponent(JSON.stringify({id: String(contentId)}))}&t=${ts}&page=${p}`, { headers: hdrs, timeout: 7000 });
+              const eps = er.data?.episodes || er.data || [];
+              const epArr = Array.isArray(eps) ? eps : [];
+              if (!epArr.length) break;
+              episodes.push(...epArr);
+              const ep = epArr.find(e => String(e.ep) === String(episode));
+              if (ep) { episodeId = ep.id; foundEp = true; break; }
+            } catch (_) { break; }
+          }
+        }
+      } else if (flatEpisodes.length > 0) {
+        episodes = flatEpisodes;
+      } else {
+        // post.php returned nothing useful — try seasons from a different field
+        const seriesData = Array.isArray(postData) ? postData : [];
+        if (seriesData.length > 0) episodes = seriesData;
+      }
+
+      if (!foundEp && episodes.length > 0) {
+        const ep = episodes.find(e => String(e.ep) === String(episode));
+        if (ep) { episodeId = ep.id; foundEp = true; }
+      }
+
+      // If still not found, fetch episodes.php pages directly with contentId
+      if (!foundEp) {
+        for (let p = 1; p <= 10; p++) {
+          try {
+            const er = await ax.get(`https://net52.cc/mobile/episodes.php?s=${contentId}&series=${encodeURIComponent(JSON.stringify({id: String(contentId)}))}&t=${ts}&page=${p}`, { headers: hdrs, timeout: 7000 });
+            const epArr = Array.isArray(er.data) ? er.data : (er.data?.episodes || []);
+            if (!epArr.length) break;
+            epArr.forEach(e => { if (!episodes.find(x => x.id === e.id)) episodes.push(e); });
+            const ep = epArr.find(e => String(e.ep) === String(episode));
+            if (ep) { episodeId = ep.id; foundEp = true; break; }
+          } catch (_) { break; }
+        }
+      }
+      console.log(`[Player] Step4-primary (net52 native episodes) done in ${Date.now()-t4}ms — ${episodes.length} eps, episodeId=${episodeId}`);
+    } catch (e) {
+      console.warn(`[Player] Step4-primary (net52 post.php) failed: ${e.message}`);
+    }
+
+    // --- Fallback: tv.imgcdn.kim (original method, now secondary) ---
+    if (!foundEp) {
       try {
-        const tvHdrs2 = { "X-Requested-With": "NetmirrorNewTV v1.0", "User-Agent": "Mozilla/5.0 /OS.GatuNewTV v1.0", "ott": ott };
+        const tvHdrs = { "X-Requested-With": "NetmirrorNewTV v1.0", "User-Agent": "Mozilla/5.0 /OS.GatuNewTV v1.0", "ott": ott };
         for (let p = 1; p <= 5; p++) {
-          const r = await ax.get(`https://tv.imgcdn.kim/${o.episodes}?id=${contentId}&page=${p}`, { headers: tvHdrs2, timeout: 8000 });
+          const r = await ax.get(`https://tv.imgcdn.kim/${o.episodes}?id=${contentId}&page=${p}`, { headers: tvHdrs, timeout: 8000 });
           const eps = r.data?.episodes || [];
           if (!eps.length) break;
-          episodes.push(...eps);
+          eps.forEach(e => { if (!episodes.find(x => x.id === e.id)) episodes.push(e); });
+          const ep = eps.find(e => String(e.ep) === String(episode));
+          if (ep) { episodeId = ep.id; foundEp = true; break; }
         }
-        const ep = episodes.find(e => String(e.ep) === String(episode));
-        if (ep) episodeId = ep.id;
+        console.log(`[Player] Step4-fallback (tv.imgcdn.kim) — ${episodes.length} eps, found=${foundEp}`);
       } catch (_) {}
+    }
+
+    if (!foundEp) {
+      console.warn(`[Player] Episode ${episode} not found for ${contentId} — using series ID as fallback (may fail)`);
     }
   }
 
@@ -448,8 +528,25 @@ app.get("/api/player", async (req, res) => {
       if (inToken2 && !file.includes('in=')) {
         file += (file.includes('?') ? '&' : '?') + 'in=' + inToken2;
       }
-      const m3u8  = 'https://net52.cc' + file;
-      const proxy = `http://127.0.0.1:3000/proxy/hls?url=${encodeURIComponent(m3u8)}&ref=${refEnc}&cookie=${hlsCookie}&ott=${ott}&ua=${uaEnc}`;
+      // Normalize the source URL (same logic as net52.js getPlaylist):
+      // playlist.php can return: full URL, protocol-relative (//files/...), relative path (files/...)
+      let m3u8 = file;
+      if (m3u8.startsWith('http://') || m3u8.startsWith('https://')) {
+        // Validate hostname — if it's just 'files' or has no dot, remap to net52.cc
+        try {
+          const _p = new URL(m3u8);
+          if (_p.hostname === 'files' || !_p.hostname.includes('.')) {
+            m3u8 = 'https://net52.cc' + _p.pathname + _p.search;
+          }
+        } catch (_) {}
+      } else if (m3u8.startsWith('//')) {
+        m3u8 = 'https://net52.cc' + m3u8.slice(1);
+      } else if (m3u8.startsWith('/')) {
+        m3u8 = 'https://net52.cc' + m3u8;
+      } else if (m3u8) {
+        m3u8 = 'https://net52.cc/' + m3u8;
+      }
+      const proxy = `${globalThis.APP_URL}/proxy/hls?url=${encodeURIComponent(m3u8)}&ref=${refEnc}&cookie=${hlsCookie}&ott=${ott}&ua=${uaEnc}`;
       return { label: s.label || 'Auto', proxy, direct: m3u8 };
     });
     subtitles = tracks.map(t => ({ label: t.label || t.lang, url: 'https:' + (t.file || t.url || '') }));

@@ -114,7 +114,7 @@ async function fetchOpenSubtitlesHelper(tmdbId, type, season, episode) {
           lang = lang[0].toUpperCase() + lang.substring(1);
         }
         
-        const proxyUrl = `http://127.0.0.1:3000/subtitles/download?url=${encodeURIComponent(r.SubDownloadLink)}`;
+        const proxyUrl = `${globalThis.APP_URL}/subtitles/download?url=${encodeURIComponent(r.SubDownloadLink)}`;
         return {
           url: proxyUrl,
           lang: lang,
@@ -360,91 +360,7 @@ async function load(url, options = {}) {
     });
   }
   
-  // Query 4KHDHub inside CineStream to avoid parallel processing on the client
-  try {
-    const isMovie = type === 'movie';
-    const isSeriesEpisode = type === 'series' && options.season && options.episode;
-    
-    if (isMovie || isSeriesEpisode) {
-      console.log(`[CineStream] Automatically fetching 4KHDHub links inside load (type=${type}, season=${options.season}, episode=${options.episode})`);
-      const fourKHDHubProvider = (await import('../4khdhub/index.js')).default;
-      const searchResults = await fourKHDHubProvider.search(title);
-      
-      const cleanTitle = title.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-      let best = null;
-      let bestScore = -1;
-      
-      for (const r of searchResults) {
-        const rTitle = r.title.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-        let score = 0;
-        if (rTitle === cleanTitle) score = 200;
-        else if (rTitle.includes(cleanTitle)) score = 80;
-        if (score > bestScore) {
-          bestScore = score;
-          best = r;
-        }
-      }
-      
-      if (best && bestScore >= 40) {
-        const details = await fourKHDHubProvider.load(best.url);
-        if (details && details.episodes) {
-          const parseSizeToMb = (sizeStr) => {
-            if (!sizeStr) return 999999;
-            const match = sizeStr.match(/(\d+(?:\.\d+)?)\s*(GB|MB)/i);
-            if (!match) return 999999;
-            const val = parseFloat(match[1]);
-            const unit = match[2].toUpperCase();
-            if (unit === 'GB') return val * 1024;
-            return val;
-          };
-
-          const qualityGroups = {};
-          
-          details.episodes.forEach(ep => {
-            const isMovieMatch = isMovie && ep.episode === 'Movie';
-            const isSeriesMatch = isSeriesEpisode && 
-              (ep.episode.toString() === options.episode.toString() ||
-               ep.episode.toString().toLowerCase().replace('episode', '').trim() === options.episode.toString());
-               
-            if (isMovieMatch || isSeriesMatch) {
-              const qBadge = (ep.quality || 'Unknown').toLowerCase().trim();
-              
-              // Only allow 4K (2160) from 4KHDHub (A)
-              const is4k = /4k|2160/i.test(qBadge);
-              if (!is4k) {
-                return; // SKIP 1080p, 720p, 480p, etc. from 4KHDHub (A)
-              }
-
-              const sizeInMb = parseSizeToMb(ep.size);
-              if (!qualityGroups[qBadge] || sizeInMb < qualityGroups[qBadge].sizeInMb) {
-                qualityGroups[qBadge] = { ep, sizeInMb };
-              }
-            }
-          });
-          
-          Object.values(qualityGroups).forEach(group => {
-            const ep = group.ep;
-            episodes.push({
-              episode: isMovie ? 'Movie' : options.episode.toString(),
-              season: isMovie ? undefined : options.season.toString(),
-              quality: ep.quality,
-              size: ep.size,
-              title: `4KHDHub — ${ep.title}`,
-              url: JSON.stringify({
-                source: '4khdhub',
-                server: ep.url,
-                title: ep.title,
-                quality: ep.quality,
-                size: ep.size
-              })
-            });
-          });
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[CineStream] Failed to load 4khdhub links inside load:', err.message);
-  }
+  // CineStream is just Netmirror and VidSrc combined. No 4KHDHub injection here.
 
   // ── Inject Netmirror (Netflix/Prime/Hotstar) prioritized at the top ─────────
   try {
@@ -473,24 +389,28 @@ async function load(url, options = {}) {
             let score = 0;
             if (rTitle === cleanTitle) score = 200;
             else if (rTitle.includes(cleanTitle)) score = 80;
+
+            // Year-based scoring with ±1 year tolerance
+            // (net52 often tags content 1 year behind TMDB release date)
+            if (score > 0 && year) {
+              const rYear = String(r.year || '');
+              const reqYr = parseInt(year, 10);
+              const resYr = parseInt(rYear, 10);
+              if (rYear && !isNaN(resYr)) {
+                if (Math.abs(resYr - reqYr) <= 1) score += 100;  // within 1 year → boost
+                else score -= 150;                                  // >1 year off → disqualify
+              }
+              // empty year in net52 → no penalty (missing data shouldn't reject correct content)
+            }
+
             if (score > bestScore) {
               bestScore = score;
               best = r;
             }
           }
           
-          // Require near-exact title match (>=150) to avoid false OTT positives
-          if (best && bestScore >= 150) {
+            if (best && bestScore >= 150) {
             const details = await netmirror.load(best.url, ott.code);
-            if (details && details.episodes && details.episodes.length > 0) {
-              try {
-                const firstEpUrl = JSON.parse(details.episodes[0].url);
-                if (firstEpUrl.tmdbId && tmdbId && parseInt(firstEpUrl.tmdbId, 10) !== parseInt(tmdbId, 10)) {
-                  console.log(`[CineStream] Netmirror ${ott.name} TMDB ID mismatch (got ${firstEpUrl.tmdbId}, expected ${tmdbId}). Skipping.`);
-                  return null;
-                }
-              } catch (_) {}
-            }
             if (details && details.episodes) {
               const matchedEp = details.episodes.find(ep => {
                 if (isMovie) return true;
@@ -525,52 +445,23 @@ async function load(url, options = {}) {
 
       const validNetmirror = netmirrorResults.filter(Boolean);
 
-      // Separate current episodes (which has 4KHDHub + VidSrc)
-      const eps4k_A = [];
-      const eps1080p_A = [];
-      const others = [];
-
-      episodes.forEach(ep => {
-        try {
-          const u = JSON.parse(ep.url);
-          if (u.source === '4khdhub') {
-            const q = (ep.quality || '').toLowerCase();
-            if (/4k|2160/i.test(q)) {
-              eps4k_A.push(ep);
-            } else if (/1080/i.test(q)) {
-              eps1080p_A.push(ep);
-            }
-            // Skip 720p, 480p, etc. from A (already handled in details iteration, but double-safe here)
-          } else {
-            others.push(ep);
-          }
-        } catch {
-          others.push(ep);
-        }
-      });
-
-      // Split the remaining B sources (VidSrc and any others)
-      const epsVidSrc = others.filter(ep => {
+      // Split current episodes (which only has VidSrc)
+      const epsVidSrc = episodes.filter(ep => {
         try { return JSON.parse(ep.url).source === 'vidsrc'; } catch { return false; }
       });
-      const epsRest_B = others.filter(ep => {
+      const epsRest_B = episodes.filter(ep => {
         try { return JSON.parse(ep.url).source !== 'vidsrc'; } catch { return true; }
       });
 
-      // Clear the episodes list and push strictly by quality priority:
-      // 1) 4K: A > B (eps4k_A first, then B 4K if any)
-      // 2) 1080p: A > B (eps1080p_A first, then validNetmirror streaming, then rest B 1080p if any)
-      // 3) 720p and below: B only (Rest B, VidSrc)
+      // Netmirror first, then other B, then VidSrc fallback B
       episodes.length = 0;
       episodes.push(
-        ...eps4k_A,
-        ...eps1080p_A,
         ...validNetmirror,
         ...epsRest_B,
         ...epsVidSrc
       );
 
-      console.log(`[CineStream] Priority sorted: ${eps4k_A.length} 4K (A), ${eps1080p_A.length} 1080p (A), ${validNetmirror.length} Netmirror (B), ${epsRest_B.length + epsVidSrc.length} other (B).`);
+      console.log(`[CineStream] Priority sorted: ${validNetmirror.length} Netmirror (B), ${epsRest_B.length + epsVidSrc.length} other (B).`);
     }
   } catch (err) {
     console.error('[CineStream] Netmirror auto-injection failed:', err.message);
@@ -629,7 +520,7 @@ async function resolveVidlinkHelper(id, tmdbId, type, season, episode) {
               vidlinkServers.push({
                 label,
                 url: val.url,
-                proxyUrl: `http://127.0.0.1:3000/proxy/video/${encodeURIComponent(filename)}?url=${encodeURIComponent(val.url)}&ref=${encodeURIComponent('https://vidlink.pro/')}`
+                proxyUrl: `${globalThis.APP_URL}/proxy/video/${encodeURIComponent(filename)}?url=${encodeURIComponent(val.url)}&ref=${encodeURIComponent('https://vidlink.pro/')}`
               });
             }
           });
@@ -955,7 +846,7 @@ async function getStreams(watchUrl) {
       resolved.sort((a, b) => getQualityScore(b) - getQualityScore(a));
 
       const bestStream = resolved[0];
-      const proxiedUrl = `http://127.0.0.1:3000/proxy/hls?url=${encodeURIComponent(bestStream.url)}&ref=${encodeURIComponent('https://vidfast.io/')}`;
+      const proxiedUrl = `${globalThis.APP_URL}/proxy/hls?url=${encodeURIComponent(bestStream.url)}&ref=${encodeURIComponent('https://vidfast.io/')}`;
       console.log(`[CineStream] Selected best Vidfast server: ${bestStream.name} (${bestStream.desc || 'no desc'})`);
 
       // Build all-servers map for unified quality picker
@@ -969,7 +860,7 @@ async function getStreams(watchUrl) {
             label,
             server: s.name,
             url: s.url,
-            proxyUrl: `http://127.0.0.1:3000/proxy/hls?url=${encodeURIComponent(s.url)}&ref=${encodeURIComponent('https://vidfast.io/')}`,
+            proxyUrl: `${globalThis.APP_URL}/proxy/hls?url=${encodeURIComponent(s.url)}&ref=${encodeURIComponent('https://vidfast.io/')}`,
           };
         })
         .filter(Boolean);
@@ -1235,7 +1126,7 @@ async function getStreams(watchUrl) {
           label: lnk.resolution ? `${lnk.resolution}p` : '1080p',
           server: 'Zxc',
           url: lnk.link,
-          proxyUrl: `http://127.0.0.1:3000/proxy/${proxyPath}?url=${encodeURIComponent(lnk.link)}&ref=${encodeURIComponent(baseUrl + '/')}&ua=${encodeURIComponent(headers['User-Agent'] || '')}`,
+          proxyUrl: `${globalThis.APP_URL}/proxy/${proxyPath}?url=${encodeURIComponent(lnk.link)}&ref=${encodeURIComponent(baseUrl + '/')}&ua=${encodeURIComponent(headers['User-Agent'] || '')}`,
         };
       });
 
@@ -1264,12 +1155,12 @@ async function getStreams(watchUrl) {
                 label: lnk.resolution ? `${lnk.resolution}p` : '1080p',
                 server: `Zxc [${dub.name}]`,
                 url: lnk.link,
-                proxyUrl: `http://127.0.0.1:3000/proxy/${proxyPath}?url=${encodeURIComponent(lnk.link)}&ref=${encodeURIComponent(baseUrl + '/')}&ua=${encodeURIComponent(headers['User-Agent'] || '')}`,
+                proxyUrl: `${globalThis.APP_URL}/proxy/${proxyPath}?url=${encodeURIComponent(lnk.link)}&ref=${encodeURIComponent(baseUrl + '/')}&ua=${encodeURIComponent(headers['User-Agent'] || '')}`,
                 lang: dub.lang,
                 langName: dub.name,
               });
             }
-            console.log(`[CineStream] VidSrc: ${dub.name} dub âœ… â€” ${list.length} quality links`);
+            console.log(`[CineStream] VidSrc: ${dub.name} dub ✅ — ${list.length} quality links`);
             return list;
           }
         } catch (dubErr) {

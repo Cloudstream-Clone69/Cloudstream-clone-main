@@ -119,6 +119,7 @@ export const mainUrl = 'https://net52.cc'; // kept for backwards compat
  * A lock prevents multiple simultaneous bypass calls on first load.
  */
 const tokenCache = { token: null, expiresAt: 0 };
+const deadTokens = new Set();
 let bypassInProgress = null; // Promise lock
 
 /** ~2.9 days (server gives 3 days, we refresh 2h early) */
@@ -224,45 +225,63 @@ async function doVerifyBypass() {
  *  3. Persisted in app-settings.json (survives restarts, valid 3 days)
  *  4. Fresh verify.php bypass (POST) — ::99 tier, works for PrimeVideo only
  */
-export async function getToken(ott = 'pv') {
+export async function getToken(ott = 'pv', forceRefresh = false) {
   // Priority 1: Universal in-memory cache (fastest)
-  if (tokenCache.token && Date.now() < tokenCache.expiresAt) {
-    return tokenCache.token;
+  if (!forceRefresh && tokenCache.token && Date.now() < tokenCache.expiresAt) {
+    if (!deadTokens.has(tokenCache.token)) {
+      return tokenCache.token;
+    } else {
+      console.log('[Net52] Cached token is blacklisted, ignoring');
+      tokenCache.token = null;
+      tokenCache.expiresAt = 0;
+    }
   }
 
   // Priority 2: Stored / Manually Injected token from app-settings.json
   // This ensures the local Token Injector web page (Option 1) works instantly!
-  const stored = readStoredToken();
-  if (stored) {
-    const parts = stored.split('::');
-    const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
-    const age = Date.now() - ts;
-    if (age < SESSION_TTL_MS) {
-      console.log('[Net52] Using fresh injected/stored token (age: ' + Math.round(age / 3600000) + 'h)');
-      tokenCache.token = stored;
-      tokenCache.expiresAt = ts + SESSION_TTL_MS;
-      return stored;
+  if (!forceRefresh) {
+    const stored = readStoredToken();
+    if (stored) {
+      if (!deadTokens.has(stored)) {
+        const parts = stored.split('::');
+        const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
+        const age = Date.now() - ts;
+        if (age < SESSION_TTL_MS) {
+          console.log('[Net52] Using fresh injected/stored token (age: ' + Math.round(age / 3600000) + 'h)');
+          tokenCache.token = stored;
+          tokenCache.expiresAt = ts + SESSION_TTL_MS;
+          return stored;
+        }
+        console.log('[Net52] Stored token expired, checking other options...');
+      } else {
+        console.log('[Net52] Stored token is blacklisted, ignoring');
+      }
     }
-    console.log('[Net52] Stored token expired, checking other options...');
   }
 
   // Priority 3: ::m premium token from remote GitHub config (community fallback)
-  try {
-    await getRemoteConfig(); // ensure config is loaded
-    const mToken = cfg.mToken;
-    if (mToken && mToken.includes('::m')) {
-      const parts = mToken.split('::');
-      const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
-      const age = Date.now() - ts;
-      if (age < SESSION_TTL_MS) {
-        console.log('[Net52] Using ::m premium token from GitHub config ✅');
-        tokenCache.token = mToken;
-        tokenCache.expiresAt = ts + SESSION_TTL_MS;
-        return mToken;
+  if (!forceRefresh) {
+    try {
+      await getRemoteConfig(); // ensure config is loaded
+      const mToken = cfg.mToken;
+      if (mToken && mToken.includes('::m')) {
+        if (!deadTokens.has(mToken)) {
+          const parts = mToken.split('::');
+          const ts = parts[2] ? parseInt(parts[2], 10) * 1000 : 0;
+          const age = Date.now() - ts;
+          if (age < SESSION_TTL_MS) {
+            console.log('[Net52] Using ::m premium token from GitHub config ✅');
+            tokenCache.token = mToken;
+            tokenCache.expiresAt = ts + SESSION_TTL_MS;
+            return mToken;
+          }
+        } else {
+          console.log('[Net52] GitHub token is blacklisted, ignoring');
+        }
       }
+    } catch (err) {
+      console.warn('[Net52] Remote config check failed:', err.message);
     }
-  } catch (err) {
-    console.warn('[Net52] Remote config check failed:', err.message);
   }
 
   // Priority 4: Fresh verify.php bypass (::99 tier fallback)
@@ -329,8 +348,8 @@ export async function searchNet52(query, ott = 'pv') {
  * Call playlist.php — server returns m3u8 URLs with the in= token already embedded.
  * Verified from Frida REQ #4323 and live testing.
  */
-export async function getPlaylist(contentId, title, ott = 'pv') {
-  const token = await getToken(ott);
+export async function getPlaylist(contentId, title, ott = 'pv', forceRefresh = false) {
+  const token = await getToken(ott, forceRefresh);
   await getRemoteConfig(); // ensure config is loaded
   const ottPaths = cfg.ott[ott] || cfg.ott.pv;
   const timestamp = Math.floor(Date.now() / 1000);
@@ -446,7 +465,8 @@ export async function fetchHlsWithToken(contentId, ott) {
       m3u8.includes('warning') ||
       (m3u8.length > 0 && m3u8.length < 300 && !m3u8.includes('#EXT-X-STREAM-INF'));
     if (isWarningVideo) {
-      console.warn('[Net52] Warning video detected — forcing token refresh via verify.php...');
+      console.warn('[Net52] Warning video detected — blacklisting token and forcing refresh:', playlist.token.substring(0, 30) + '...');
+      deadTokens.add(playlist.token);
       tokenCache.token = null; // reset universal cache
       tokenCache.expiresAt = 0;
       // Clear stored dead token so bypass runs fresh
@@ -458,7 +478,7 @@ export async function fetchHlsWithToken(contentId, ott) {
           fs.writeFileSync(SETTINGS_PATH, JSON.stringify(s, null, 2), 'utf8');
         }
       } catch (_) {}
-      const retry = await getPlaylist(contentId, contentId, ott);
+      const retry = await getPlaylist(contentId, contentId, ott, true);
       const rs = retry.sources.find(s => !s.url.includes('q=')) || retry.sources[0];
       return { type: 'hls', hlsUrl: rs.url, cdnToken: retry.token, audioTracks: [], variants: retry.sources, contentId };
     }
@@ -519,7 +539,7 @@ export async function resetSession() {
         console.log('[Net52] Cleared stored token from app-settings.json');
       }
     } catch (_) {}
-    const token = await getToken();
+    const token = await getToken('pv', true);
     return { ok: true, source: 'verify.php', token };
   } catch (e) {
     return { ok: false, error: e.message };
